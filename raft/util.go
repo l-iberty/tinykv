@@ -110,6 +110,22 @@ func ltoa(l *RaftLog) string {
 	return s
 }
 
+func wrap(ents []pb.Entry) []*pb.Entry {
+	_ents := make([]*pb.Entry, 0)
+	for i := range ents {
+		_ents = append(_ents, &ents[i])
+	}
+	return _ents
+}
+
+func unwrap(ents []*pb.Entry) []pb.Entry {
+	_ents := make([]pb.Entry, 0)
+	for i := range ents {
+		_ents = append(_ents, *ents[i])
+	}
+	return _ents
+}
+
 type uint64Slice []uint64
 
 func (p uint64Slice) Len() int           { return len(p) }

@@ -7,18 +7,12 @@ import (
 	"fmt"
 	"math"
 
-	proto "github.com/golang/protobuf/proto"
-
 	_ "github.com/gogo/protobuf/gogoproto"
-
+	proto "github.com/golang/protobuf/proto"
 	coprocessor "github.com/pingcap-incubator/tinykv/proto/pkg/coprocessor"
-
 	kvrpcpb "github.com/pingcap-incubator/tinykv/proto/pkg/kvrpcpb"
-
 	raft_serverpb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
-
 	context "golang.org/x/net/context"
-
 	grpc "google.golang.org/grpc"
 )
 

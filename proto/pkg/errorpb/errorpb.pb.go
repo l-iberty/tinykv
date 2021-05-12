@@ -8,10 +8,8 @@ import (
 	"io"
 	"math"
 
-	proto "github.com/golang/protobuf/proto"
-
 	_ "github.com/gogo/protobuf/gogoproto"
-
+	proto "github.com/golang/protobuf/proto"
 	metapb "github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 )
 

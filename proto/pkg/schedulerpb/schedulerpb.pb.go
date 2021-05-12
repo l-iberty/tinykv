@@ -8,16 +8,11 @@ import (
 	"io"
 	"math"
 
-	proto "github.com/golang/protobuf/proto"
-
 	_ "github.com/gogo/protobuf/gogoproto"
-
+	proto "github.com/golang/protobuf/proto"
 	eraftpb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-
 	metapb "github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
-
 	context "golang.org/x/net/context"
-
 	grpc "google.golang.org/grpc"
 )
 

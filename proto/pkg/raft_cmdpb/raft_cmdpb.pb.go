@@ -9,10 +9,8 @@ import (
 	"math"
 
 	proto "github.com/golang/protobuf/proto"
-
 	eraftpb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	errorpb "github.com/pingcap-incubator/tinykv/proto/pkg/errorpb"
-
 	metapb "github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 )
 
