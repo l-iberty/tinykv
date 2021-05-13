@@ -79,7 +79,7 @@ func newLog(storage Storage) *RaftLog {
 		storage:   storage,
 		committed: sfi - 1,
 		applied:   sfi - 1,
-		stabled:   sfi,
+		stabled:   sli,
 		offset:    sli + 1,
 	}
 

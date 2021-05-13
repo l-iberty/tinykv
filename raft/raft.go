@@ -779,7 +779,9 @@ func stepLeader(r *Raft, m pb.Message) error {
 			r.sendAppend(m.From)
 		} else {
 			pr.update(m.Index)
-			r.maybeCommit()
+			if r.maybeCommit() {
+				r.bcastAppend()
+			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
