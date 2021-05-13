@@ -473,6 +473,15 @@ func (r *Raft) resetRandomizedElectionTimeout() {
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
 	// Your Code Here (2A).
+	switch r.State {
+	case StateFollower:
+		r.step = stepFollower
+	case StateCandidate:
+		r.step = stepCandidate
+	case StateLeader:
+		r.step = stepLeader
+	}
+
 	switch {
 	case m.Term == 0:
 		// local message
@@ -568,6 +577,10 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgHeartbeat:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleHeartbeat(m)
 	}
 	return nil
 }
@@ -602,7 +615,7 @@ func stepCandidate(r *Raft, m pb.Message) error {
 
 func stepLeader(r *Raft, m pb.Message) error {
 	switch m.MsgType {
-	case pb.MessageType_MsgHeartbeat:
+	case pb.MessageType_MsgBeat:
 		r.bcastHeartbeat()
 		return nil
 	case pb.MessageType_MsgPropose:
@@ -885,7 +898,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
 	r.RaftLog.commitTo(m.Commit)
 	r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgHeartbeatResponse})
-
 }
 
 // handleSnapshot handle Snapshot RPC request
