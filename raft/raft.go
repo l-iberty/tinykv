@@ -343,7 +343,7 @@ func (r *Raft) tickHeartbeat() {
 
 	if r.heartbeatElapsed >= r.heartbeatTimeout {
 		r.heartbeatElapsed = 0
-		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHeartbeat})
+		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgBeat})
 	}
 }
 
