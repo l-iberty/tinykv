@@ -323,7 +323,7 @@ func (r *Raft) bcastHeartbeat() {
 func (r *Raft) tickElection() {
 	r.electionElapsed++
 
-	if r.electionElapsed >= r.electionTimeout {
+	if r.promotable() && r.pastElectionTimeout() {
 		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
@@ -463,6 +463,17 @@ func (r *Raft) maybeCommit() bool {
 	})
 	mi := matches[(len(matches)-1)/2]
 	return r.RaftLog.maybeCommit(mi, r.Term)
+}
+
+// promotable indicates whether state machine can be promoted to leader,
+// which is true when its own id is in progress list.
+func (r *Raft) promotable() bool {
+	pr := r.Prs[r.id]
+	return pr != nil
+}
+
+func (r *Raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
 }
 
 func (r *Raft) resetRandomizedElectionTimeout() {
@@ -784,7 +795,28 @@ func (r *Raft) recordVote(id uint64, voteGranted bool) {
 	}
 }
 
+func (r *Raft) hup() {
+	if r.State == StateLeader {
+		log.Debugf("%x ignoring MsgHup because already leader", r.id)
+		return
+	}
+
+	if !r.promotable() {
+		log.Warningf("%x is unpromotable and can not campaign", r.id)
+		return
+	}
+
+	log.Infof("%x is starting a new election at term %d", r.id, r.Term)
+	r.campaign()
+}
+
 func (r *Raft) campaign() {
+	if !r.promotable() {
+		// This path should not be hit (callers are supposed to check), but
+		// better safe than sorry.
+		log.Warningf("%x is unpromotable; campaign() should have been called", r.id)
+	}
+
 	r.becomeCandidate()
 	if _, _, res := r.poll(r.id, true); res == VoteWon {
 		r.becomeLeader()
@@ -807,16 +839,6 @@ func (r *Raft) campaign() {
 		log.Infof("%x [logterm: %d, index: %d] sent %s to %x at term %d",
 			r.id, m.LogTerm, m.Index, m.MsgType, id, r.Term)
 	}
-}
-
-func (r *Raft) hup() {
-	if r.State == StateLeader {
-		log.Debugf("%x ignoring MsgHup because already leader", r.id)
-		return
-	}
-
-	log.Infof("%x is starting a new election at term %d", r.id, r.Term)
-	r.campaign()
 }
 
 func (r *Raft) poll(id uint64, voteGranted bool) (granted int, rejected int, result VoteResult) {
