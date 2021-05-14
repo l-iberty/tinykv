@@ -276,7 +276,7 @@ func (r *Raft) sendAppend(to uint64) bool {
 	m.MsgType = pb.MessageType_MsgAppend
 	m.Index = pr.Next - 1 // prevLogIndex
 	m.LogTerm = term      // prevLogTerm
-	m.Entries = wrap(ents)
+	m.Entries = ref(ents)
 	m.Commit = r.RaftLog.committed // leaderCommit
 
 	r.send(m)
@@ -391,13 +391,12 @@ func (r *Raft) becomeLeader() {
 }
 
 func (r *Raft) appendEntries(ents ...*pb.Entry) {
-	entries := unwrap(ents)
 	li := r.RaftLog.LastIndex()
 	for i := range ents {
-		entries[i].Term = r.Term
-		entries[i].Index = li + 1 + uint64(i)
+		ents[i].Term = r.Term
+		ents[i].Index = li + 1 + uint64(i)
 	}
-	li = r.RaftLog.append(entries...)
+	li = r.RaftLog.append(ents...)
 	r.Prs[r.id].update(li)
 	r.maybeCommit()
 }
@@ -885,7 +884,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		return
 	}
 
-	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, unwrap(m.Entries)...); ok {
+	if mlastIndex, ok := r.RaftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
 		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: mlastIndex})
 	} else {
 		log.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",

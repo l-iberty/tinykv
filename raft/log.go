@@ -96,11 +96,10 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	ents, err := l.slice(l.stabled+1, l.LastIndex()+1)
-	if err != nil {
-		panic(err)
+	if len(l.entries) == 0 {
+		return nil
 	}
-	return ents
+	return l.entries
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -193,7 +192,7 @@ func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
 
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
-func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
+func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...*pb.Entry) (lastnewi uint64, ok bool) {
 	if l.matchTerm(index, logTerm) {
 		lastnewi = index + uint64(len(ents))
 		ci := l.findConflict(ents)
@@ -211,7 +210,7 @@ func (l *RaftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 	return 0, false
 }
 
-func (l *RaftLog) append(ents ...pb.Entry) uint64 {
+func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	if len(ents) == 0 {
 		return l.LastIndex()
 	}
@@ -222,18 +221,18 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 	switch {
 	case after == l.offset+uint64(len(l.entries)):
 		// after if the next index in the l.entries directly append
-		l.entries = append(l.entries, ents...)
+		l.entries = append(l.entries, deref(ents)...)
 	case after <= l.offset:
 		log.Infof("replace the unstable entries from index %d", after)
 		// The log is being truncated to before our current offset
 		// portion, so set the offset and replace the entries
 		l.offset = after
-		l.entries = ents
+		l.entries = deref(ents)
 	default:
 		// truncate to after and copy to l.entries, then append
 		log.Infof("truncate the unstable entries before index %d", after)
 		l.entries = append([]pb.Entry{}, l.mustSlice(l.offset, after)...)
-		l.entries = append(l.entries, ents...)
+		l.entries = append(l.entries, deref(ents)...)
 	}
 	return l.LastIndex()
 }
@@ -248,7 +247,7 @@ func (l *RaftLog) append(ents ...pb.Entry) uint64 {
 // An entry is considered to be conflicting if it has the same index but
 // a different term.
 // The index of the given entries MUST be continuously increasing.
-func (l *RaftLog) findConflict(ents []pb.Entry) uint64 {
+func (l *RaftLog) findConflict(ents []*pb.Entry) uint64 {
 	for _, ne := range ents {
 		if !l.matchTerm(ne.Index, ne.Term) {
 			return ne.Index

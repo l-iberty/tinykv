@@ -104,13 +104,13 @@ func mustTemp(pre, body string) string {
 func ltoa(l *RaftLog) string {
 	s := fmt.Sprintf("committed: %d\n", l.committed)
 	s += fmt.Sprintf("applied:  %d\n", l.applied)
-	for i, e := range l.entries {
+	for i, e := range l.allEntries() {
 		s += fmt.Sprintf("#%d: %+v\n", i, e)
 	}
 	return s
 }
 
-func wrap(ents []pb.Entry) []*pb.Entry {
+func ref(ents []pb.Entry) []*pb.Entry {
 	_ents := make([]*pb.Entry, 0)
 	for i := range ents {
 		_ents = append(_ents, &ents[i])
@@ -118,7 +118,7 @@ func wrap(ents []pb.Entry) []*pb.Entry {
 	return _ents
 }
 
-func unwrap(ents []*pb.Entry) []pb.Entry {
+func deref(ents []*pb.Entry) []pb.Entry {
 	_ents := make([]pb.Entry, 0)
 	for i := range ents {
 		_ents = append(_ents, *ents[i])
