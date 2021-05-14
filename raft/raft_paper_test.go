@@ -908,8 +908,10 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	// ignore further messages to refresh followers' commit index
 	r.readMessages()
 	s.Append(r.RaftLog.unstableEntries())
-	r.RaftLog.applied = r.RaftLog.committed
-	r.RaftLog.stabled = r.RaftLog.LastIndex()
+	// r.RaftLog.applied = r.RaftLog.committed
+	// r.RaftLog.stabled = r.RaftLog.LastIndex()
+	r.RaftLog.appliedTo(r.RaftLog.committed)
+	r.RaftLog.stableTo(r.RaftLog.LastIndex(), r.RaftLog.LastTerm())
 }
 
 func acceptAndReply(m pb.Message) pb.Message {

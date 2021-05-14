@@ -322,14 +322,27 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 	}
 }
 
-func (l *RaftLog) appliedTo(i uint64) {
-	if i == 0 {
+func (l *RaftLog) appliedTo(index uint64) {
+	if index == 0 {
 		return
 	}
-	if l.committed < i || i < l.applied {
-		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", i, l.applied, l.committed)
+	if l.committed < index || index < l.applied {
+		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", index, l.applied, l.committed)
 	}
-	l.applied = i
+	l.applied = index
+}
+
+func (l *RaftLog) stableTo(index, term uint64) {
+	if index < l.offset || index > l.LastIndex() {
+		return
+	}
+
+	t := l.entries[index-l.offset].Term
+	if t == term && index >= l.offset {
+		l.entries = l.entries[index+1-l.offset:]
+		l.offset = index + 1
+		l.stabled = index
+	}
 }
 
 func (l *RaftLog) FirstIndex() uint64 {
