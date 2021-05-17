@@ -514,62 +514,7 @@ func (r *Raft) Step(m pb.Message) error {
 	case pb.MessageType_MsgHup:
 		r.hup()
 	case pb.MessageType_MsgRequestVote:
-		// We can vote if this is a repeat of a vote we've already cast...
-		canVote := r.Vote == m.From ||
-			// ...we haven't voted and we don't think there's a leader yet in this term...
-			(r.Vote == None && r.Lead == None)
-		// ...and we believe the candidate is up to date.
-		if canVote && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
-			// Note: it turns out that that learners must be allowed to cast votes.
-			// This seems counter- intuitive but is necessary in the situation in which
-			// a learner has been promoted (i.e. is now a voter) but has not learned
-			// about this yet.
-			// For example, consider a group in which id=1 is a learner and id=2 and
-			// id=3 are voters. A configuration change promoting 1 can be committed on
-			// the quorum `{2,3}` without the config change being appended to the
-			// learner's log. If the leader (say 2) fails, there are de facto two
-			// voters remaining. Only 3 can win an election (due to its log containing
-			// all committed entries), but to do so it will need 1 to vote. But 1
-			// considers itself a learner and will continue to do so until 3 has
-			// stepped up as leader, replicates the conf change to 1, and 1 applies it.
-			// Ultimately, by receiving a request to vote, the learner realizes that
-			// the candidate believes it to be a voter, and that it should act
-			// accordingly. The candidate's config may be stale, too; but in that case
-			// it won't win the election, at least in the absence of the bug discussed
-			// in:
-			// https://github.com/etcd-io/etcd/issues/7625#issuecomment-488798263.
-			log.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
-				r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
-			// When responding to Msg{Pre,}Vote messages we include the term
-			// from the message, not the local term. To see why, consider the
-			// case where a single node was previously partitioned away and
-			// it's local term is now out of date. If we include the local term
-			// (recall that for pre-votes we don't update the local term), the
-			// (pre-)campaigning node on the other end will proceed to ignore
-			// the message (it ignores all out of date messages).
-			// The term in the original message and current local term are the
-			// same in the case of regular votes, but different for pre-votes.
-			r.send(pb.Message{
-				To:      m.From,
-				Term:    m.Term,
-				MsgType: pb.MessageType_MsgRequestVoteResponse,
-			})
-			if m.MsgType == pb.MessageType_MsgRequestVote {
-				// Only record real votes.
-				r.electionElapsed = 0
-				r.Vote = m.From
-			}
-		} else {
-			log.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
-				r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
-			r.send(pb.Message{
-				To:      m.From,
-				Term:    r.Term,
-				MsgType: pb.MessageType_MsgRequestVoteResponse,
-				Reject:  true,
-			})
-		}
-
+		r.handleRequestVote(m)
 	default:
 		err := r.step(r, m)
 		if err != nil {
@@ -653,124 +598,10 @@ func stepLeader(r *Raft, m pb.Message) error {
 	switch m.MsgType {
 	case pb.MessageType_MsgAppendResponse:
 		if m.Reject {
-			// RejectHint is the suggested next base entry for appending (i.e.
-			// we try to append entry RejectHint+1 next), and LogTerm is the
-			// term that the follower has at index RejectHint. Older versions
-			// of this library did not populate LogTerm for rejections and it
-			// is zero for followers with an empty log.
-			//
-			// Under normal circumstances, the leader's log is longer than the
-			// follower's and the follower's log is a prefix of the leader's
-			// (i.e. there is no divergent uncommitted suffix of the log on the
-			// follower). In that case, the first probe reveals where the
-			// follower's log ends (RejectHint=follower's last index) and the
-			// subsequent probe succeeds.
-			//
-			// However, when networks are partitioned or systems overloaded,
-			// large divergent log tails can occur. The naive attempt, probing
-			// entry by entry in decreasing order, will be the product of the
-			// length of the diverging tails and the network round-trip latency,
-			// which can easily result in hours of time spent probing and can
-			// even cause outright outages. The probes are thus optimized as
-			// described below.
 			log.Debugf("%x received MsgAppResp(rejected, hint: (index %d, term %d)) from %x for index %d",
 				r.id, m.RejectHint, m.LogTerm, m.From, m.Index)
 			nextProbeIdx := m.RejectHint
 			if m.LogTerm > 0 {
-				// If the follower has an uncommitted log tail, we would end up
-				// probing one by one until we hit the common prefix.
-				//
-				// For example, if the leader has:
-				//
-				//   idx        1 2 3 4 5 6 7 8 9
-				//              -----------------
-				//   term (L)   1 3 3 3 5 5 5 5 5
-				//   term (F)   1 1 1 1 2 2
-				//
-				// Then, after sending an append anchored at (idx=9,term=5) we
-				// would receive a RejectHint of 6 and LogTerm of 2. Without the
-				// code below, we would try an append at index 6, which would
-				// fail again.
-				//
-				// However, looking only at what the leader knows about its own
-				// log and the rejection hint, it is clear that a probe at index
-				// 6, 5, 4, 3, and 2 must fail as well:
-				//
-				// For all of these indexes, the leader's log term is larger than
-				// the rejection's log term. If a probe at one of these indexes
-				// succeeded, its log term at that index would match the leader's,
-				// i.e. 3 or 5 in this example. But the follower already told the
-				// leader that it is still at term 2 at index 9, and since the
-				// log term only ever goes up (within a log), this is a contradiction.
-				//
-				// At index 1, however, the leader can draw no such conclusion,
-				// as its term 1 is not larger than the term 2 from the
-				// follower's rejection. We thus probe at 1, which will succeed
-				// in this example. In general, with this approach we probe at
-				// most once per term found in the leader's log.
-				//
-				// There is a similar mechanism on the follower (implemented in
-				// handleAppendEntries via a call to findConflictByTerm) that is
-				// useful if the follower has a large divergent uncommitted log
-				// tail[1], as in this example:
-				//
-				//   idx        1 2 3 4 5 6 7 8 9
-				//              -----------------
-				//   term (L)   1 3 3 3 3 3 3 3 7
-				//   term (F)   1 3 3 4 4 5 5 5 6
-				//
-				// Naively, the leader would probe at idx=9, receive a rejection
-				// revealing the log term of 6 at the follower. Since the leader's
-				// term at the previous index is already smaller than 6, the leader-
-				// side optimization discussed above is ineffective. The leader thus
-				// probes at index 8 and, naively, receives a rejection for the same
-				// index and log term 5. Again, the leader optimization does not improve
-				// over linear probing as term 5 is above the leader's term 3 for that
-				// and many preceding indexes; the leader would have to probe linearly
-				// until it would finally hit index 3, where the probe would succeed.
-				//
-				// Instead, we apply a similar optimization on the follower. When the
-				// follower receives the probe at index 8 (log term 3), it concludes
-				// that all of the leader's log preceding that index has log terms of
-				// 3 or below. The largest index in the follower's log with a log term
-				// of 3 or below is index 3. The follower will thus return a rejection
-				// for index=3, log term=3 instead. The leader's next probe will then
-				// succeed at that index.
-				//
-				// [1]: more precisely, if the log terms in the large uncommitted
-				// tail on the follower are larger than the leader's. At first,
-				// it may seem unintuitive that a follower could even have such
-				// a large tail, but it can happen:
-				//
-				// 1. Leader appends (but does not commit) entries 2 and 3, crashes.
-				//   idx        1 2 3 4 5 6 7 8 9
-				//              -----------------
-				//   term (L)   1 2 2     [crashes]
-				//   term (F)   1
-				//   term (F)   1
-				//
-				// 2. a follower becomes leader and appends entries at term 3.
-				//              -----------------
-				//   term (x)   1 2 2     [down]
-				//   term (F)   1 3 3 3 3
-				//   term (F)   1
-				//
-				// 3. term 3 leader goes down, term 2 leader returns as term 4
-				//    leader. It commits the log & entries at term 4.
-				//
-				//              -----------------
-				//   term (L)   1 2 2 2
-				//   term (x)   1 3 3 3 3 [down]
-				//   term (F)   1
-				//              -----------------
-				//   term (L)   1 2 2 2 4 4 4
-				//   term (F)   1 3 3 3 3 [gets probed]
-				//   term (F)   1 2 2 2 4 4 4
-				//
-				// 4. the leader will now probe the returning follower at index
-				//    7, the rejection points it at the end of the follower's log
-				//    which is at a higher log term than the actually committed
-				//    log.
 				nextProbeIdx = r.RaftLog.findConflictByTerm(m.RejectHint, m.LogTerm)
 			}
 			pr.decreaseTo(m.Index, nextProbeIdx)
@@ -876,7 +707,36 @@ func (r *Raft) tallyVotes() (int, int, VoteResult) {
 	return granted, rejected, result
 }
 
-// handleAppendEntries handle AppendEntries RPC request
+// handleRequestVote handles RequestVote RPC request
+func (r *Raft) handleRequestVote(m pb.Message) {
+	canVote := r.Vote == m.From ||
+		(r.Vote == None && r.Lead == None)
+	if canVote && r.RaftLog.isUpToDate(m.Index, m.LogTerm) {
+		log.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
+			r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+		r.send(pb.Message{
+			To:      m.From,
+			Term:    m.Term,
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+		})
+		if m.MsgType == pb.MessageType_MsgRequestVote {
+			// Only record real votes.
+			r.electionElapsed = 0
+			r.Vote = m.From
+		}
+	} else {
+		log.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
+			r.id, r.RaftLog.LastTerm(), r.RaftLog.LastIndex(), r.Vote, m.MsgType, m.From, m.LogTerm, m.Index, r.Term)
+		r.send(pb.Message{
+			To:      m.From,
+			Term:    r.Term,
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			Reject:  true,
+		})
+	}
+}
+
+// handleAppendEntries handles AppendEntries RPC request
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 	if m.Index < r.RaftLog.committed {

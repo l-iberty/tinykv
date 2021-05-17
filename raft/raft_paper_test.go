@@ -890,13 +890,7 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 	if r.State != StateLeader {
 		panic("it should only be used when it is the leader")
 	}
-	for id := range r.Prs {
-		if id == r.id {
-			continue
-		}
-
-		r.sendAppend(id)
-	}
+	r.bcastAppend()
 	// simulate the response of MessageType_MsgAppend
 	msgs := r.readMessages()
 	for _, m := range msgs {

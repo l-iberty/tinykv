@@ -15,8 +15,6 @@
 package raft
 
 import (
-	"errors"
-
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -382,7 +380,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// i 落在 storage.entries 还是 l.entries
 	dummyIndex := l.FirstIndex() - 1
 	if i < dummyIndex || i > l.LastIndex() {
-		return 0, errors.New("index out of bound")
+		return 0, nil
 	}
 
 	if len(l.entries) > 0 && i >= l.offset {
@@ -398,6 +396,6 @@ func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	if err == ErrCompacted {
 		return 0
 	}
-	// log.Panicf("unexpected error (%v)", err)
+	log.Panicf("unexpected error (%v)", err)
 	return 0
 }
