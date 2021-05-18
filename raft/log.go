@@ -79,6 +79,7 @@ func newLog(storage Storage) *RaftLog {
 		applied:   sfi - 1,
 		stabled:   sli,
 		offset:    sli + 1,
+		entries:   []pb.Entry{},
 	}
 
 	return log
@@ -94,9 +95,6 @@ func (l *RaftLog) maybeCompact() {
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	if len(l.entries) == 0 {
-		return nil
-	}
 	return l.entries
 }
 
@@ -343,6 +341,12 @@ func (l *RaftLog) stableTo(index, term uint64) {
 	}
 }
 
+func (l *RaftLog) stableSnapTo(index uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == index {
+		l.pendingSnapshot = nil
+	}
+}
+
 func (l *RaftLog) FirstIndex() uint64 {
 	i, err := l.storage.FirstIndex()
 	if err != nil {
@@ -398,4 +402,14 @@ func (l *RaftLog) zeroTermOnErrCompacted(t uint64, err error) uint64 {
 	}
 	log.Panicf("unexpected error (%v)", err)
 	return 0
+}
+
+// hasNextEnts returns if there is any available entries for execution.
+func (l *RaftLog) hasNextEnts() bool {
+	off := max(l.applied+1, l.LastIndex())
+	return l.committed+1 > off
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil && !IsEmptySnap(l.pendingSnapshot)
 }

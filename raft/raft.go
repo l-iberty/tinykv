@@ -227,7 +227,6 @@ func newRaft(c *Config) *Raft {
 		RaftLog:          raftLog,
 		Prs:              map[uint64]*Progress{},
 		votes:            map[uint64]bool{},
-		msgs:             []pb.Message{},
 		heartbeatTimeout: c.HeartbeatTick,
 		electionTimeout:  c.ElectionTick,
 	}
@@ -796,4 +795,28 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) advance(rd Ready) {
+	if newApplied := rd.appliedCursor(); newApplied > 0 {
+		r.RaftLog.appliedTo(newApplied)
+	}
+
+	if n := len(rd.Entries); n > 0 {
+		e := rd.Entries[n-1]
+		r.RaftLog.stableTo(e.Index, e.Term)
+	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	}
 }
