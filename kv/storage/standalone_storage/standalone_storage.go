@@ -84,9 +84,11 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 				txn.Discard()
 				return err
 			}
+			txn.Discard()
 
 		case storage.Delete:
 			txn := s.engines.Kv.NewTransaction(true)
+
 			cfKey := engine_util.KeyWithCF(m.Cf(), m.Data.(storage.Delete).Key)
 			if err := txn.Delete(cfKey); err != nil {
 				txn.Discard()
@@ -96,6 +98,7 @@ func (s *StandAloneStorage) Write(ctx *kvrpcpb.Context, batch []storage.Modify) 
 				txn.Discard()
 				return err
 			}
+			txn.Discard()
 		}
 	}
 	return nil
