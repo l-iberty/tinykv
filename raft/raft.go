@@ -17,12 +17,13 @@ package raft
 import (
 	"errors"
 	"fmt"
-	"github.com/pingcap-incubator/tinykv/log"
-	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"math/rand"
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
 // None is a placeholder node ID used when there is no leader.
@@ -215,7 +216,7 @@ func newRaft(c *Config) *Raft {
 	// Your Code Here (2A).
 
 	raftLog := newLog(c.Storage)
-	hs, _, err := c.Storage.InitialState()
+	hs, cs, err := c.Storage.InitialState()
 	if err != nil {
 		panic(err)
 	}
@@ -231,7 +232,12 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 	}
 
-	for _, id := range c.peers {
+	peers := c.peers
+	if len(peers) == 0 {
+		peers = cs.Nodes
+	}
+
+	for _, id := range peers {
 		r.Prs[id] = &Progress{}
 	}
 
@@ -323,6 +329,7 @@ func (r *Raft) tickElection() {
 	r.electionElapsed++
 
 	if r.promotable() && r.pastElectionTimeout() {
+		log.Infof("%d election timeout (%d)", r.id, r.randomizedElectionTimeout)
 		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
