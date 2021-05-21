@@ -247,8 +247,5 @@ func (rd Ready) appliedCursor() uint64 {
 	if n := len(rd.CommittedEntries); n > 0 {
 		return rd.CommittedEntries[n-1].Index
 	}
-	if index := rd.Snapshot.Metadata.Index; index > 0 {
-		return index
-	}
 	return 0
 }

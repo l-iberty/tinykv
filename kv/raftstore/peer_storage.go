@@ -308,6 +308,21 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+
+	regionID := ps.Region().GetId()
+
+	for _, ent := range entries {
+		key := meta.RaftLogKey(regionID, ent.Index)
+		if err := raftWB.SetMeta(key, &ent); err != nil {
+			return err
+		}
+	}
+
+	key := meta.RaftStateKey(regionID)
+	if err := raftWB.SetMeta(key, ps.raftState); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -320,7 +335,7 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	}
 
 	// Hint: things need to do here including: update peer storage state like raftState and applyState, etc,
-	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
+	// and mustSendRaftMessages RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
 	return nil, nil
@@ -331,6 +346,17 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+
+	// kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+
+	if err := ps.Append(ready.Entries, raftWB); err != nil {
+		return nil, err
+	}
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 

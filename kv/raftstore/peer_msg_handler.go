@@ -43,6 +43,24 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		return
 	}
 	// Your Code Here (2B).
+	node := d.RaftGroup
+	if node.HasReady() {
+		rd := node.Ready()
+
+		_, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
+			panic(err)
+		}
+
+		// sending raft messages to other peers through the network.
+		d.Send(d.ctx.trans, rd.Messages)
+
+		for _, ent := range rd.CommittedEntries {
+			log.Infof("applying log entry [%v]", ent)
+		}
+
+		node.Advance(rd)
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -114,6 +132,23 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	p := &proposal{
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	}
+	d.proposals = append(d.proposals, p)
+
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	if err := d.RaftGroup.Propose(data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,27 +258,27 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
 	fromStoreID := msg.FromPeer.GetStoreId()
 
 	// Let's consider following cases with three nodes [1, 2, 3] and 1 is leader:
-	// a. 1 removes 2, 2 may still send MsgAppendResponse to 1.
+	// a. 1 removes 2, 2 may still mustSendRaftMessages MsgAppendResponse to 1.
 	//  We should ignore this stale message and let 2 remove itself after
 	//  applying the ConfChange log.
 	// b. 2 is isolated, 1 removes 2. When 2 rejoins the cluster, 2 will
-	//  send stale MsgRequestVote to 1 and 3, at this time, we should tell 2 to gc itself.
+	//  mustSendRaftMessages stale MsgRequestVote to 1 and 3, at this time, we should tell 2 to gc itself.
 	// c. 2 is isolated but can communicate with 3. 1 removes 3.
-	//  2 will send stale MsgRequestVote to 3, 3 should ignore this message.
+	//  2 will mustSendRaftMessages stale MsgRequestVote to 3, 3 should ignore this message.
 	// d. 2 is isolated but can communicate with 3. 1 removes 2, then adds 4, remove 3.
-	//  2 will send stale MsgRequestVote to 3, 3 should tell 2 to gc itself.
+	//  2 will mustSendRaftMessages stale MsgRequestVote to 3, 3 should tell 2 to gc itself.
 	// e. 2 is isolated. 1 adds 4, 5, 6, removes 3, 1. Now assume 4 is leader.
-	//  After 2 rejoins the cluster, 2 may send stale MsgRequestVote to 1 and 3,
-	//  1 and 3 will ignore this message. Later 4 will send messages to 2 and 2 will
+	//  After 2 rejoins the cluster, 2 may mustSendRaftMessages stale MsgRequestVote to 1 and 3,
+	//  1 and 3 will ignore this message. Later 4 will mustSendRaftMessages messages to 2 and 2 will
 	//  rejoin the raft group again.
 	// f. 2 is isolated. 1 adds 4, 5, 6, removes 3, 1. Now assume 4 is leader, and 4 removes 2.
 	//  unlike case e, 2 will be stale forever.
@@ -290,7 +325,7 @@ func handleStaleMsg(trans Transport, msg *rspb.RaftMessage, curEpoch *metapb.Reg
 		IsTombstone: true,
 	}
 	if err := trans.Send(gcMsg); err != nil {
-		log.Errorf("[region %d] send message failed %v", regionID, err)
+		log.Errorf("[region %d] mustSendRaftMessages message failed %v", regionID, err)
 	}
 }
 
@@ -492,7 +527,7 @@ func (d *peerMsgHandler) validateSplitRegion(epoch *metapb.RegionEpoch, splitKey
 
 	// This is a little difference for `check_region_epoch` in region split case.
 	// Here we just need to check `version` because `conf_ver` will be update
-	// to the latest value of the peer, and then send to Scheduler.
+	// to the latest value of the peer, and then mustSendRaftMessages to Scheduler.
 	if latestEpoch.Version != epoch.Version {
 		log.Infof("%s epoch changed, retry later, prev_epoch: %s, epoch %s",
 			d.Tag, latestEpoch, epoch)
