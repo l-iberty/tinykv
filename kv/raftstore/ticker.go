@@ -1,6 +1,8 @@
 package raftstore
 
 import (
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/config"
@@ -8,6 +10,7 @@ import (
 )
 
 type ticker struct {
+	mu        sync.RWMutex
 	regionID  uint64
 	tick      int64
 	schedules []tickSchedule
@@ -45,37 +48,49 @@ func newStoreTicker(cfg *config.Config) *ticker {
 
 // tickClock should be called when peerMsgHandler received tick message.
 func (t *ticker) tickClock() {
-	t.tick++
+	atomic.AddInt64(&t.tick, 1)
 }
 
 // schedule arrange the next run for the PeerTick.
 func (t *ticker) schedule(tp PeerTick) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	sched := &t.schedules[int(tp)]
 	if sched.interval <= 0 {
 		sched.runAt = -1
 		return
 	}
-	sched.runAt = t.tick + sched.interval
+	sched.runAt = atomic.LoadInt64(&t.tick) + sched.interval
 }
 
 // isOnTick checks if the PeerTick should run.
 func (t *ticker) isOnTick(tp PeerTick) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	sched := &t.schedules[int(tp)]
-	return sched.runAt == t.tick
+	return sched.runAt == atomic.LoadInt64(&t.tick)
 }
 
 func (t *ticker) isOnStoreTick(tp StoreTick) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	sched := &t.schedules[int(tp)]
-	return sched.runAt == t.tick
+	return sched.runAt == atomic.LoadInt64(&t.tick)
 }
 
 func (t *ticker) scheduleStore(tp StoreTick) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	sched := &t.schedules[int(tp)]
 	if sched.interval <= 0 {
 		sched.runAt = -1
 		return
 	}
-	sched.runAt = t.tick + sched.interval
+	sched.runAt = atomic.LoadInt64(&t.tick) + sched.interval
 }
 
 type tickDriver struct {

@@ -4,6 +4,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Connor1996/badger"
+
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
@@ -55,8 +63,23 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		// sending raft messages to other peers through the network.
 		d.Send(d.ctx.trans, rd.Messages)
 
-		for _, ent := range rd.CommittedEntries {
-			log.Infof("applying log entry [%v]", ent)
+		if n := len(rd.CommittedEntries); n > 0 {
+			for _, ent := range rd.CommittedEntries {
+				if ent.Data != nil {
+					if err := d.process(&ent); err != nil {
+						panic(err)
+					}
+				}
+			}
+			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[n-1].Index
+
+			wb := new(engine_util.WriteBatch)
+			if err := wb.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+				panic(err)
+			}
+			if err := wb.WriteToDB(d.peerStorage.Engines.Raft); err != nil {
+				panic(err)
+			}
 		}
 
 		node.Advance(rd)
@@ -149,6 +172,100 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
+}
+
+func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
+	msg := new(raft_cmdpb.RaftCmdRequest)
+	if err := msg.Unmarshal(entry.Data); err != nil {
+		return err
+	}
+	kvWB := new(engine_util.WriteBatch)
+	responses := make([]*raft_cmdpb.Response, 0)
+	for _, req := range msg.Requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Get:
+			// log.Infof("%s processing %s command [cf: %s, key: %s]", d.Tag, req.CmdType, req.Get.Cf, req.Get.Key)
+			if len(responses) > 0 {
+				panic(fmt.Sprintf("%s command shouldn't mix with other commands", req.CmdType))
+			}
+
+		case raft_cmdpb.CmdType_Put:
+			// log.Infof("%s processing %s command [cf: %s, key: %s, value: %s]", d.Tag, req.CmdType, req.Put.Cf, req.Put.Key, req.Put.Value)
+			if err := util.CheckKeyInRegion(req.Put.Key, d.Region()); err != nil {
+				d.notify(entry, ErrResp(err), nil)
+				return err
+			}
+			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			responses = append(responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Put,
+				Put:     &raft_cmdpb.PutResponse{},
+			})
+
+		case raft_cmdpb.CmdType_Delete:
+			// log.Infof("%s processing %s command [cf: %s, key: %s]", d.Tag, req.CmdType, req.Delete.Cf, req.Delete.Key)
+			if err := util.CheckKeyInRegion(req.Delete.Key, d.Region()); err != nil {
+				d.notify(entry, ErrResp(err), nil)
+				return err
+			}
+			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+			responses = append(responses, &raft_cmdpb.Response{
+				CmdType: raft_cmdpb.CmdType_Delete,
+				Delete:  &raft_cmdpb.DeleteResponse{},
+			})
+
+		case raft_cmdpb.CmdType_Snap:
+			// log.Infof("%s processing %s command", d.Tag, req.CmdType)
+			if len(responses) > 0 {
+				panic(fmt.Sprintf("%s command shouldn't mix with other commands", req.CmdType))
+			}
+			if msg.Header.RegionEpoch.GetVersion() != d.Region().RegionEpoch.GetVersion() {
+				err := &util.ErrEpochNotMatch{}
+				d.notify(entry, ErrResp(err), nil)
+				return err
+			}
+			txn := d.peerStorage.Engines.Kv.NewTransaction(false)
+			resp := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				Responses: []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				}},
+			}
+			d.notify(entry, resp, txn)
+			return nil
+
+		default:
+			log.Warnf("invalid cmd type: %v", req.CmdType)
+		}
+	}
+	if kvWB.Len() > 0 {
+		if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+			return err
+		}
+	}
+
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header:    &raft_cmdpb.RaftResponseHeader{},
+		Responses: responses,
+	}
+	d.notify(entry, resp, nil)
+	return nil
+}
+
+func (d *peerMsgHandler) notify(entry *eraftpb.Entry, resp *raft_cmdpb.RaftCmdResponse, txn *badger.Txn) {
+	if len(d.proposals) == 0 {
+		return
+	}
+	for i := len(d.proposals) - 1; i >= 0; i-- {
+		p := d.proposals[i]
+		if p.index == entry.Index && p.term == entry.Term {
+			p.cb.Txn = txn
+			p.cb.Done(resp)
+			d.proposals = d.proposals[:i]
+			return
+		}
+	}
+	panic("no matched proposal found")
 }
 
 func (d *peerMsgHandler) onTick() {
