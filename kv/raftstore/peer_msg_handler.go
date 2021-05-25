@@ -66,9 +66,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if n := len(rd.CommittedEntries); n > 0 {
 			for _, ent := range rd.CommittedEntries {
 				if ent.Data != nil {
-					if err := d.process(&ent); err != nil {
-						panic(err)
-					}
+					d.process(&ent)
 				}
 			}
 			d.peerStorage.applyState.AppliedIndex = rd.CommittedEntries[n-1].Index
@@ -174,11 +172,12 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 	}
 }
 
-func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
+func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
 	msg := new(raft_cmdpb.RaftCmdRequest)
 	if err := msg.Unmarshal(entry.Data); err != nil {
-		return err
+		panic(err)
 	}
+
 	kvWB := new(engine_util.WriteBatch)
 	responses := make([]*raft_cmdpb.Response, 0)
 	for _, req := range msg.Requests {
@@ -189,11 +188,26 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 				panic(fmt.Sprintf("%s command shouldn't mix with other commands", req.CmdType))
 			}
 
+			value, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+			if err != nil {
+				d.notify(entry, ErrResp(err), nil)
+				return
+			}
+			resp := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{},
+				Responses: []*raft_cmdpb.Response{{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: value},
+				}},
+			}
+			d.notify(entry, resp, nil)
+			return
+
 		case raft_cmdpb.CmdType_Put:
 			// log.Infof("%s processing %s command [cf: %s, key: %s, value: %s]", d.Tag, req.CmdType, req.Put.Cf, req.Put.Key, req.Put.Value)
-			if err := util.CheckKeyInRegion(req.Put.Key, d.Region()); err != nil {
+			if err := d.checkKeyInRegion(req.Put.Key); err != nil {
 				d.notify(entry, ErrResp(err), nil)
-				return err
+				return
 			}
 			kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
 			responses = append(responses, &raft_cmdpb.Response{
@@ -203,9 +217,9 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 
 		case raft_cmdpb.CmdType_Delete:
 			// log.Infof("%s processing %s command [cf: %s, key: %s]", d.Tag, req.CmdType, req.Delete.Cf, req.Delete.Key)
-			if err := util.CheckKeyInRegion(req.Delete.Key, d.Region()); err != nil {
+			if err := d.checkKeyInRegion(req.Delete.Key); err != nil {
 				d.notify(entry, ErrResp(err), nil)
-				return err
+				return
 			}
 			kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
 			responses = append(responses, &raft_cmdpb.Response{
@@ -218,10 +232,9 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 			if len(responses) > 0 {
 				panic(fmt.Sprintf("%s command shouldn't mix with other commands", req.CmdType))
 			}
-			if msg.Header.RegionEpoch.GetVersion() != d.Region().RegionEpoch.GetVersion() {
-				err := &util.ErrEpochNotMatch{}
+			if err := d.checkRegionEpochVersion(msg.Header.RegionEpoch); err != nil {
 				d.notify(entry, ErrResp(err), nil)
-				return err
+				return
 			}
 			txn := d.peerStorage.Engines.Kv.NewTransaction(false)
 			resp := &raft_cmdpb.RaftCmdResponse{
@@ -232,7 +245,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 				}},
 			}
 			d.notify(entry, resp, txn)
-			return nil
+			return
 
 		default:
 			log.Warnf("invalid cmd type: %v", req.CmdType)
@@ -240,7 +253,7 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 	}
 	if kvWB.Len() > 0 {
 		if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
-			return err
+			return
 		}
 	}
 
@@ -249,6 +262,17 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) error {
 		Responses: responses,
 	}
 	d.notify(entry, resp, nil)
+	return
+}
+
+func (d *peerMsgHandler) checkKeyInRegion(key []byte) error {
+	return util.CheckKeyInRegion(key, d.Region())
+}
+
+func (d *peerMsgHandler) checkRegionEpochVersion(re *metapb.RegionEpoch) error {
+	if re.GetVersion() != d.Region().GetRegionEpoch().GetVersion() {
+		return &util.ErrEpochNotMatch{}
+	}
 	return nil
 }
 
@@ -265,7 +289,7 @@ func (d *peerMsgHandler) notify(entry *eraftpb.Entry, resp *raft_cmdpb.RaftCmdRe
 			return
 		}
 	}
-	panic("no matched proposal found")
+	// log.Warnf("no matched proposal found for entry [index = %d, term = %d]", entry.Index, entry.Term)
 }
 
 func (d *peerMsgHandler) onTick() {

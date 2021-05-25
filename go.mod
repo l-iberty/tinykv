@@ -14,6 +14,7 @@ require (
 	github.com/onsi/gomega v1.10.0 // indirect
 	github.com/opentracing/opentracing-go v1.0.2
 	github.com/petar/GoLLRB v0.0.0-20190514000832-33fb24c13b99
+	github.com/petermattis/goid v0.0.0-20180202154549-b0b1615b78e5 // indirect
 	github.com/pingcap/check v0.0.0-20200212061837-5e12011dc712
 	github.com/pingcap/errcode v0.0.0-20180921232412-a1a7271709d9
 	github.com/pingcap/errors v0.11.5-0.20190809092503-95897b64e011
@@ -22,6 +23,7 @@ require (
 	github.com/pingcap/tipb v0.0.0-20200212061130-c4d518eb1d60
 	github.com/pkg/errors v0.8.1
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
+	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/shirou/gopsutil v2.19.10+incompatible
 	github.com/sirupsen/logrus v1.2.0
 	github.com/stretchr/testify v1.4.0

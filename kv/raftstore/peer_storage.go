@@ -315,13 +315,12 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 		}
 	}
 
-	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
-		return err
-	}
-
 	if n := len(entries); n > 0 {
 		ps.raftState.LastIndex = entries[n-1].Index
 		ps.raftState.LastTerm = entries[n-1].Term
+	}
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return err
 	}
 
 	return nil
@@ -351,7 +350,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
 
-	if raft.IsEmptyHardState(ready.HardState) {
+	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
 	if err := ps.Append(ready.Entries, raftWB); err != nil {
