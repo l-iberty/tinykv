@@ -282,9 +282,20 @@ func (d *peerMsgHandler) notify(entry *eraftpb.Entry, resp *raft_cmdpb.RaftCmdRe
 	}
 	for i := len(d.proposals) - 1; i >= 0; i-- {
 		p := d.proposals[i]
-		if p.index == entry.Index && p.term == entry.Term {
-			p.cb.Txn = txn
-			p.cb.Done(resp)
+		if p.index == entry.Index {
+			if p.cb == nil {
+				log.Panicf("CallBack at [index = %d, term = %d] is corrupted", p.index, p.term)
+			}
+			if !d.IsLeader() {
+				log.Warnf("%x is not a leader", d.PeerId())
+			}
+			if p.term == entry.Term {
+				p.cb.Txn = txn
+				p.cb.Done(resp)
+			} else {
+				log.Warnf("%x proposal term not matched at index = %d [entry.term = %d, proposal.term = %d]", d.PeerId(), entry.Index, entry.Term, p.term)
+				NotifyStaleReq(entry.Term, p.cb)
+			}
 			d.proposals = d.proposals[:i]
 			return
 		}
