@@ -144,9 +144,14 @@ func (pr *Progress) decreaseTo(rejected, matchHint uint64) {
 	pr.Next = max(min(rejected, matchHint+1), 1)
 }
 
-func (pr *Progress) update(match uint64) {
-	pr.Match = max(pr.Match, match)
+func (pr *Progress) maybeUpdate(match uint64) bool {
+	var updated bool
+	if pr.Match < match {
+		pr.Match = match
+		updated = true
+	}
 	pr.Next = max(pr.Next, match+1)
+	return updated
 }
 
 type Raft struct {
@@ -262,30 +267,40 @@ func (r *Raft) loadState(state pb.HardState) {
 }
 
 // sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
+// current commit index to the given peer.
+func (r *Raft) sendAppend(to uint64) {
 	// Your Code Here (2A).
 	pr := r.Prs[to]
 	m := pb.Message{}
 	m.To = to
 
-	term, err := r.RaftLog.Term(pr.Next - 1)
-	if err != nil {
-		panic(err)
+	term, errt := r.RaftLog.Term(pr.Next - 1)
+	ents, erre := r.RaftLog.slice(pr.Next, r.RaftLog.LastIndex()+1)
+	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		m.MsgType = pb.MessageType_MsgSnapshot
+		snapshot, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return
+			}
+			panic(err)
+		}
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+		m.Snapshot = &snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		log.Infof("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%v]",
+			r.id, r.RaftLog.FirstIndex(), r.RaftLog.committed, sindex, sterm, to, pr)
+	} else {
+		m.MsgType = pb.MessageType_MsgAppend
+		m.Index = pr.Next - 1 // prevLogIndex
+		m.LogTerm = term      // prevLogTerm
+		m.Entries = ref(ents)
+		m.Commit = r.RaftLog.committed // leaderCommit
 	}
-	ents, err := r.RaftLog.slice(pr.Next, r.RaftLog.LastIndex()+1)
-	if err != nil {
-		panic(err)
-	}
-
-	m.MsgType = pb.MessageType_MsgAppend
-	m.Index = pr.Next - 1 // prevLogIndex
-	m.LogTerm = term      // prevLogTerm
-	m.Entries = ref(ents)
-	m.Commit = r.RaftLog.committed // leaderCommit
-
 	r.send(m)
-	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -403,7 +418,7 @@ func (r *Raft) appendEntries(ents ...*pb.Entry) {
 		ents[i].Index = li + 1 + uint64(i)
 	}
 	li = r.RaftLog.append(ents...)
-	r.Prs[r.id].update(li)
+	r.Prs[r.id].maybeUpdate(li)
 	r.maybeCommit()
 }
 
@@ -542,6 +557,10 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleHeartbeat(m)
+	case pb.MessageType_MsgSnapshot:
+		r.electionElapsed = 0
+		r.Lead = m.From
+		r.handleSnapshot(m)
 	}
 	return nil
 }
@@ -614,9 +633,10 @@ func stepLeader(r *Raft, m pb.Message) error {
 			log.Debugf("%x decreased progress of %x to [%v]", r.id, m.From, pr)
 			r.sendAppend(m.From)
 		} else {
-			pr.update(m.Index)
-			if r.maybeCommit() {
-				r.bcastAppend()
+			if pr.maybeUpdate(m.Index) {
+				if r.maybeCommit() {
+					r.bcastAppend()
+				}
 			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
@@ -792,6 +812,53 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	sindex, sterm := m.Snapshot.Metadata.Index, m.Snapshot.Metadata.Term
+	if r.restore(m.Snapshot) {
+		log.Infof("%x [commit: %d] restored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
+	} else {
+		log.Infof("%x [commit: %d] ignored snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, sindex, sterm)
+		r.send(pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed})
+	}
+}
+
+func (r *Raft) restore(s *pb.Snapshot) bool {
+	if s.Metadata.Index <= r.RaftLog.committed {
+		return false
+	}
+	if r.State != StateFollower {
+		// This is defense-in-depth: if the leader somehow ended up applying a
+		// snapshot, it could move into a new term without moving into a
+		// follower state. This should never fire, but if it did, we'd have
+		// prevented damage by returning early, so log only a loud warning.
+		//
+		// At the time of writing, the instance is guaranteed to be in follower
+		// state when this method is called.
+		log.Warnf("%x attempted to restore snapshot as leader; should never happen", r.id)
+		r.becomeFollower(r.Term+1, None)
+		return false
+	}
+
+	if r.RaftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		log.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
+			r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), s.Metadata.Index, s.Metadata.Term)
+		r.RaftLog.commitTo(s.Metadata.Index)
+		return false
+	}
+
+	r.RaftLog.restore(s)
+
+	// Reset the configuration and add the (potentially updated) peers in anew.
+	r.Prs = map[uint64]*Progress{}
+	for _, id := range s.Metadata.ConfState.Nodes {
+		r.Prs[id] = &Progress{}
+	}
+
+	log.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
+		r.id, r.RaftLog.committed, r.RaftLog.LastIndex(), r.RaftLog.LastTerm(), s.Metadata.Index, s.Metadata.Term)
+	return true
 }
 
 // addNode add a new node to raft group

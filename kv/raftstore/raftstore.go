@@ -37,12 +37,12 @@ func (r *regionItem) Less(other btree.Item) bool {
 
 type storeMeta struct {
 	sync.RWMutex
-	/// region end key -> region ID
+	// / region end key -> region ID
 	regionRanges *btree.BTree
-	/// region_id -> region
+	// / region_id -> region
 	regions map[uint64]*metapb.Region
-	/// `MsgRequestVote` messages from newly split Regions shouldn't be dropped if there is no
-	/// such Region in this store now. So the messages are recorded temporarily and will be handled later.
+	// / `MsgRequestVote` messages from newly split Regions shouldn't be dropped if there is no
+	// / such Region in this store now. So the messages are recorded temporarily and will be handled later.
 	pendingVotes []*rspb.RaftMessage
 }
 
@@ -53,9 +53,11 @@ func newStoreMeta() *storeMeta {
 	}
 }
 
-func (m *storeMeta) setRegion(region *metapb.Region, peer *peer) {
+func (m *storeMeta) putRegion(region *metapb.Region) {
+	m.Lock()
+	defer m.Unlock()
 	m.regions[region.Id] = region
-	peer.SetRegion(region)
+	m.regionRanges.ReplaceOrInsert(&regionItem{region: region})
 }
 
 // getOverlaps gets the regions which are overlapped with the specified region range.
@@ -104,8 +106,8 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey

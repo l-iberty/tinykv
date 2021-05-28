@@ -15,6 +15,8 @@
 package raft
 
 import (
+	"fmt"
+
 	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -83,6 +85,10 @@ func newLog(storage Storage) *RaftLog {
 	}
 
 	return log
+}
+
+func (l *RaftLog) String() string {
+	return fmt.Sprintf("committed=%d, applied=%d, unstable.offset=%d, len(unstable.Entries)=%d", l.committed, l.applied, l.offset, len(l.entries))
 }
 
 // We need to compact the log entries in some point of time like
@@ -233,6 +239,20 @@ func (l *RaftLog) append(ents ...*pb.Entry) uint64 {
 	return l.LastIndex()
 }
 
+func (l *RaftLog) truncate(lo uint64) {
+	if lo < l.committed || lo < l.offset {
+		return
+	}
+	l.entries = append([]pb.Entry{}, l.mustSlice(l.offset, min(l.LastIndex(), lo)+1)...)
+}
+
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+	return l.storage.Snapshot()
+}
+
 // findConflict finds the index of the conflict.
 // It returns the first pair of conflicting entries between the existing
 // entries and the given entries, if there are any.
@@ -347,7 +367,17 @@ func (l *RaftLog) stableSnapTo(index uint64) {
 	}
 }
 
+func (l *RaftLog) restore(s *pb.Snapshot) {
+	log.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	l.committed = s.Metadata.Index
+	l.offset = s.Metadata.Index + 1
+	l.pendingSnapshot = s
+}
+
 func (l *RaftLog) FirstIndex() uint64 {
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
 	i, err := l.storage.FirstIndex()
 	if err != nil {
 		panic(err)
@@ -360,6 +390,9 @@ func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if n := uint64(len(l.entries)); n > 0 {
 		return l.offset + n - 1
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
 	}
 	i, err := l.storage.LastIndex()
 	if err != nil {
@@ -381,10 +414,12 @@ func (l *RaftLog) LastTerm() uint64 {
 // term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	// i 落在 storage.entries 还是 l.entries
 	dummyIndex := l.FirstIndex() - 1
 	if i < dummyIndex || i > l.LastIndex() {
 		return 0, nil
+	}
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+		return l.pendingSnapshot.Metadata.Term, nil
 	}
 
 	if len(l.entries) > 0 && i >= l.offset {

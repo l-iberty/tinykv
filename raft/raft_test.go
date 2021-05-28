@@ -353,7 +353,7 @@ func TestCommitWithoutNewTermEntry2AB(t *testing.T) {
 
 // TestCommitWithHeartbeat tests leader can send log
 // to follower when it received a heartbeat response
-// which indicate it doesn't have update-to-date log
+// which indicate it doesn't have maybeUpdate-to-date log
 func TestCommitWithHeartbeat2AB(t *testing.T) {
 	tt := newNetwork(nil, nil, nil, nil, nil)
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
@@ -1130,7 +1130,7 @@ func TestSlowNodeRestore2C(t *testing.T) {
 	}
 }
 
-// TestAddNode tests that addNode could update nodes correctly.
+// TestAddNode tests that addNode could maybeUpdate nodes correctly.
 func TestAddNode3A(t *testing.T) {
 	r := newTestRaft(1, []uint64{1}, 10, 1, NewMemoryStorage())
 	r.addNode(2)
@@ -1141,7 +1141,7 @@ func TestAddNode3A(t *testing.T) {
 	}
 }
 
-// TestRemoveNode tests that removeNode could update nodes and
+// TestRemoveNode tests that removeNode could maybeUpdate nodes and
 // and removed list correctly.
 func TestRemoveNode3A(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2}, 10, 1, NewMemoryStorage())
