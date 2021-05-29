@@ -66,6 +66,18 @@ func (d *peerMsgHandler) HandleRaftReady() {
 					d.process(&ent)
 				}
 			}
+
+			kvWB := new(engine_util.WriteBatch)
+			d.peerStorage.appliedTo(rd.CommittedEntries[n-1].Index)
+			if d.peerStorage.raftState.LastIndex < d.peerStorage.AppliedIndex() {
+				panic(nil)
+			}
+			if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+				panic(err)
+			}
+			if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
+				panic(err)
+			}
 		}
 		node.Advance(rd)
 	}

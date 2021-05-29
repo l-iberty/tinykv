@@ -510,12 +510,12 @@ func TestOneSnapshot2C(t *testing.T) {
 
 func TestSnapshotRecover2C(t *testing.T) {
 	// Test: restarts, snapshots, one client (2C) ...
-	GenericTest(t, "2C", 1, false, true, false, 10, false, false)
+	GenericTest(t, "2C", 1, false, true, false, 100, false, false)
 }
 
 func TestSnapshotRecoverManyClients2C(t *testing.T) {
 	// Test: restarts, snapshots, many clients (2C) ...
-	GenericTest(t, "2C", 20, false, true, false, 10, false, false)
+	GenericTest(t, "2C", 20, false, true, false, 100, false, false)
 }
 
 func TestSnapshotUnreliable2C(t *testing.T) {

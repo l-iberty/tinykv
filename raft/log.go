@@ -339,11 +339,11 @@ func (l *RaftLog) commitTo(tocommit uint64) {
 }
 
 func (l *RaftLog) appliedTo(index uint64) {
-	if index == 0 {
+	// if l.committed < index || index < l.applied {
+	// 	log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", index, l.applied, l.committed)
+	// }
+	if index < l.applied {
 		return
-	}
-	if l.committed < index || index < l.applied {
-		log.Panicf("applied(%d) is out of range [prevApplied(%d), committed(%d)]", index, l.applied, l.committed)
 	}
 	l.applied = index
 }

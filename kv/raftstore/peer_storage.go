@@ -370,9 +370,12 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	}
 	ps.clearExtraData(snapData.Region)
 
-	// update raftState but we don't save it to raftWB, which will be done by Append()
+	// update raftState and save it to raftWB, but it may be overwritten by Append().
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
 
 	// Update applyState and save it to kvWB
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
