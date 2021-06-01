@@ -23,7 +23,6 @@ require (
 	github.com/pingcap/tipb v0.0.0-20200212061130-c4d518eb1d60
 	github.com/pkg/errors v0.8.1
 	github.com/remyoudompheng/bigfft v0.0.0-20200410134404-eec4a21b6bb0 // indirect
-	github.com/sasha-s/go-deadlock v0.2.0
 	github.com/shirou/gopsutil v2.19.10+incompatible
 	github.com/sirupsen/logrus v1.2.0
 	github.com/stretchr/testify v1.4.0

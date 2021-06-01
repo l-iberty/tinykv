@@ -1,16 +1,16 @@
 package raftstore
 
 import (
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pingcap-incubator/tinykv/kv/config"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
-	"github.com/sasha-s/go-deadlock"
 )
 
 type ticker struct {
-	mu        deadlock.RWMutex
+	mu        sync.RWMutex
 	regionID  uint64
 	tick      int64
 	schedules []tickSchedule
