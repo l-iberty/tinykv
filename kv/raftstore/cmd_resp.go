@@ -42,6 +42,11 @@ func ErrRespStaleCommand(term uint64) *raft_cmdpb.RaftCmdResponse {
 	return ErrRespWithTerm(new(util.ErrStaleCommand), term)
 }
 
+func ErrRespNotLeader(regionId, term uint64) *raft_cmdpb.RaftCmdResponse {
+	err := &util.ErrNotLeader{RegionId: regionId}
+	return ErrRespWithTerm(err, term)
+}
+
 func ErrRespRegionNotFound(regionID uint64) *raft_cmdpb.RaftCmdResponse {
 	return &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{

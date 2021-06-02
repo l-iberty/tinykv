@@ -4,18 +4,15 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
-
-	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
-
-	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
-
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
@@ -177,7 +174,7 @@ func (d *peerMsgHandler) proposeData(msg *raft_cmdpb.RaftCmdRequest, p *proposal
 		p.cb.Done(ErrResp(err))
 		return
 	}
-	d.proposals = append(d.proposals, p)
+	d.proposals[p.index] = p
 	if err := d.RaftGroup.Propose(data); err != nil {
 		p.cb.Done(ErrResp(err))
 		return
@@ -336,26 +333,29 @@ func (d *peerMsgHandler) checkRegionEpochVersion(re *metapb.RegionEpoch) error {
 }
 
 func (d *peerMsgHandler) notify(entry *eraftpb.Entry, fn func(p *proposal)) {
-	if len(d.proposals) == 0 {
+	p, ok := d.proposals[entry.Index]
+	if !ok {
 		return
 	}
-	for i := len(d.proposals) - 1; i >= 0; i-- {
-		p := d.proposals[i]
-		if p.index == entry.Index {
-			if !d.IsLeader() {
-				log.Warnf("%x is not a leader", d.PeerId())
-			}
-			if p.term == entry.Term {
-				fn(p)
-			} else {
-				log.Warnf("%x proposal term not matched at index = %d [entry.term = %d, proposal.term = %d]", d.PeerId(), entry.Index, entry.Term, p.term)
-				NotifyStaleReq(entry.Term, p.cb)
-			}
-			// d.proposals = d.proposals[:i]
-			return
-		}
+	if p.index != entry.Index {
+		log.Warnf("no matched proposal found for entry [index = %d, term = %d]", entry.Index, entry.Term)
+		return
 	}
-	// log.Warnf("no matched proposal found for entry [index = %d, term = %d]", entry.Index, entry.Term)
+
+	if !d.IsLeader() {
+		log.Warnf("%x is not a leader", d.PeerId())
+		NotifyNotLeader(d.regionId, entry.Term, p.cb)
+		d.proposals = make(map[uint64]*proposal)
+		return
+	}
+	if p.term == entry.Term {
+		fn(p)
+	} else {
+		log.Infof("%x proposal term not matched at index = %d [entry.term = %d, proposal.term = %d]",
+			d.PeerId(), entry.Index, entry.Term, p.term)
+		NotifyStaleReq(entry.Term, p.cb)
+	}
+	delete(d.proposals, p.index)
 }
 
 func (d *peerMsgHandler) onTick() {
