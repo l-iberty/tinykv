@@ -88,7 +88,7 @@ type Callback struct {
 ```
 客户端发出请求后会在`done`上面阻塞等待，当我们把请求处理完毕后向调用`Callback.Done()`向`done`写入一个`struct{}{}`即可将结果通知给客户端。
 
-构造好的`proposal` `p`会被保存到`proposals`里面。**`proposals`是`peer`的成员变量，在 tinykv 提供的代码中这是一个`[]*proposal`类型，我不知道写 tinykv 的人为什么这么愚蠢，所以我把它改成了`map[uint64]*proposal`类型，key 就是`p.index`。如果用数组的话，查找的时候只能顺序查找。**
+构造好的`proposal` `p`会被保存到`proposals`里面。**`proposals`是`peer`的成员变量，在 tinykv 提供的代码中这是一个`[]*proposal`类型，我不知道 tinykv 为什么这么愚蠢，所以我把它改成了`map[uint64]*proposal`类型，key 就是`p.index`。如果用数组的话，查找的时候只能顺序查找。**
 
 `proposeData()`追加的日志在 Raft group 中达成一致后会被提交上来，`HandleRaftReady()`通过`Ready()`获得 committed entries 后调用`process()`进行处理。我们需要根据不同的消息类型实现不同的处理逻辑。Get/Put/Delete/Snap 是以 CmdType 发送过来的，针对 KV 数据，调用`processRequest()`；CompactLog 等是通过 AdminCmdType 发送过来的，调用`processAdminRequest()`。处理完毕后调用`notify()`将结果通知给客户端。
 
@@ -158,3 +158,332 @@ func (c *Cluster) Request(key []byte, reqs []*raft_cmdpb.Request, timeout time.D
 
 #### `HandleRaftReady()`的逻辑
 在[如何驱动Raft？](#如何驱动Raft？)已经分析过了。
+
+## Part C
+### Log compaction
+> Raftstore checks whether it needs to gc log from time to time based on the config RaftLogGcCountLimit, see onRaftGcLogTick(). If yes, it will propose a raft admin command CompactLogRequest which is wrapped in RaftCmdRequest just like four basic command types(Get/Put/Delete/Snap) implemented in project2 part B. Then you need to process this admin command when it’s committed by Raft. But unlike Get/Put/Delete/Snap commands write or read state machine data, CompactLogRequest modifies metadata, namely updates the RaftTruncatedState which is in the RaftApplyState. After that, you should schedule a task to raftlog-gc worker by ScheduleCompactLog. Raftlog-gc worker will do the actual log deletion work asynchronously.
+
+tinykv 检查 raft 日志大小的方式是周期性检查，见`peerMsgHandler.onRaftGCLogTick()`：
+```go
+func (d *peerMsgHandler) onRaftGCLogTick() {
+	d.ticker.schedule(PeerTickRaftLogGC)
+	if !d.IsLeader() {
+		return
+	}
+
+	appliedIdx := d.peerStorage.AppliedIndex()
+	firstIdx, _ := d.peerStorage.FirstIndex()
+	var compactIdx uint64
+	if appliedIdx > firstIdx && appliedIdx-firstIdx >= d.ctx.cfg.RaftLogGcCountLimit {
+		compactIdx = appliedIdx
+	} else {
+		return
+	}
+
+	y.Assert(compactIdx > 0)
+	compactIdx -= 1
+	if compactIdx < firstIdx {
+		// In case compact_idx == first_idx before subtraction.
+		return
+	}
+
+	term, err := d.RaftGroup.Raft.RaftLog.Term(compactIdx)
+	if err != nil {
+		log.Fatalf("appliedIdx: %d, firstIdx: %d, compactIdx: %d", appliedIdx, firstIdx, compactIdx)
+		panic(err)
+	}
+
+	// Create a compact log request and notify directly.
+	regionID := d.regionId
+	request := newCompactLogRequest(regionID, d.Meta, compactIdx, term)
+	d.proposeRaftCommand(request, nil)
+}
+```
+
+Log compaction 请求由`proposeRaftCommand()`发出，在 Raft group 内达成一致后被提交上来，并由`processAdminRequest()`处理：
+```go
+func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, msg *raft_cmdpb.RaftCmdRequest, kvWB *engine_util.WriteBatch) {
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		c := msg.AdminRequest.CompactLog
+		if c.CompactIndex > d.peerStorage.truncatedIndex() {
+			d.peerStorage.applyState.TruncatedState.Index = c.CompactIndex
+			d.peerStorage.applyState.TruncatedState.Term = c.CompactTerm
+			if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+				panic(err)
+			}
+			d.ScheduleCompactLog(c.CompactIndex)
+			resp := &raft_cmdpb.RaftCmdResponse{
+				Header: &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
+				AdminResponse: &raft_cmdpb.AdminResponse{
+					CmdType:    raft_cmdpb.AdminCmdType_CompactLog,
+					CompactLog: &raft_cmdpb.CompactLogResponse{},
+				},
+			}
+			d.notify(entry, func(p *proposal) {
+				p.cb.Done(resp)
+			})
+		}
+	}
+}
+```
+
+`ScheduleCompactLog()`会调度`runner.raftLogGCTaskHandler`执行日志删除动作。
+
+至于 tinykv 希望我们实现的`RaftLog.maybeCompact()`则并未被调用过，不实现这个函数也可以通过 2C 的测试。
+
+Log compaction 之后 FirstIndex 随之被修改：
+
+```go
+func (ps *PeerStorage) FirstIndex() (uint64, error) {
+	return ps.truncatedIndex() + 1, nil
+}
+```
+
+`FirstIndex`就是 Raft 论文里的`lastIncludedIndex`，该位置之前（不含）的日志都被丢弃了。
+
+tinykv 的 log compaction 和 snapshot 是分离的，和 6.824 的实现不同。 6.824 在 log compaction 的同时装载 snapshot。
+
+### Snapshot
+snapshot 的触发只在一个地方：
+```go
+func (r *Raft) sendAppend(to uint64) {
+	// Your Code Here (2A).
+	pr := r.Prs[to]
+	m := pb.Message{}
+	m.To = to
+
+	term, errt := r.RaftLog.Term(pr.Next - 1)
+	ents, erre := r.RaftLog.slice(pr.Next, r.RaftLog.LastIndex()+1)
+	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		m.MsgType = pb.MessageType_MsgSnapshot
+		snapshot, err := r.RaftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				log.Infof("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return
+			}
+			panic(err)
+		}
+		if IsEmptySnap(&snapshot) {
+			panic("need non-empty snapshot")
+		}
+		m.Snapshot = &snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		log.Infof("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%v]",
+			r.id, r.RaftLog.FirstIndex(), r.RaftLog.committed, sindex, sterm, to, pr)
+	} else {
+		m.MsgType = pb.MessageType_MsgAppend
+		m.Index = pr.Next - 1 // prevLogIndex
+		m.LogTerm = term      // prevLogTerm
+		m.Entries = ref(ents)
+		m.Commit = r.RaftLog.committed // leaderCommit
+	}
+	r.send(m)
+}
+
+func (l *RaftLog) slice(lo, hi uint64) ([]pb.Entry, error) {
+	err := l.mustCheckOutOfBounds(lo, hi)
+	......
+}
+
+func (l *RaftLog) mustCheckOutOfBounds(lo, hi uint64) error {
+	......
+	fi := l.FirstIndex()
+	if lo < fi {
+		return ErrCompacted
+	}
+	......
+}
+```
+
+这和 6.824 的实现逻辑是一样的，即`nextIndex[i] < lastIncludedIndex`时发送 InstallSnapshot RPC，否则发送 AppendEntries RPC。
+
+#### `PeerStorage`生成的 snapshot 的内容是什么？
+找到`PeerStorage.Snapshot()`：
+```go
+func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
+	var snapshot eraftpb.Snapshot
+	if ps.snapState.StateType == snap.SnapState_Generating {
+		select {
+		case s := <-ps.snapState.Receiver:
+			if s != nil {
+				snapshot = *s
+			}
+		default:
+			return snapshot, raft.ErrSnapshotTemporarilyUnavailable
+		}
+		ps.snapState.StateType = snap.SnapState_Relax
+		if snapshot.GetMetadata() != nil {
+			ps.snapTriedCnt = 0
+			if ps.validateSnap(&snapshot) {
+				return snapshot, nil
+			}
+		} else {
+			log.Warnf("%s failed to try generating snapshot, times: %d", ps.Tag, ps.snapTriedCnt)
+		}
+	}
+
+	if ps.snapTriedCnt >= 5 {
+		err := errors.Errorf("failed to get snapshot after %d times", ps.snapTriedCnt)
+		ps.snapTriedCnt = 0
+		return snapshot, err
+	}
+
+	log.Infof("%s requesting snapshot", ps.Tag)
+	ps.snapTriedCnt++
+	ch := make(chan *eraftpb.Snapshot, 1)
+	ps.snapState = snap.SnapState{
+		StateType: snap.SnapState_Generating,
+		Receiver:  ch,
+	}
+	// schedule snapshot generate task
+	ps.regionSched <- &runner.RegionTaskGen{
+		RegionId: ps.region.GetId(),
+		Notifier: ch,
+	}
+	return snapshot, raft.ErrSnapshotTemporarilyUnavailable
+}
+```
+
+第一次调用该函数的时候由于尚未处在“Generating”状态，所以返回错误。snapshot 是从`snapState.Receiver`接收的，而这个 channel 的写端是末尾那个`Notifier`。在 Goland 里“右键->Find Usages”定位到`runner`包下面的`region_task.go`：
+```go
+func (snapCtx *snapContext) handleGen(regionId uint64, notifier chan<- *eraftpb.Snapshot) {
+	snap, err := doSnapshot(snapCtx.engines, snapCtx.mgr, regionId)
+	if err != nil {
+		log.Errorf("failed to generate snapshot!!!, [regionId: %d, err : %v]", regionId, err)
+		notifier <- nil
+	} else {
+		notifier <- snap
+	}
+}
+
+func doSnapshot(engines *engine_util.Engines, mgr *snap.SnapManager, regionId uint64) (*eraftpb.Snapshot, error) {
+	log.Debugf("begin to generate a snapshot. [regionId: %d]", regionId)
+
+	txn := engines.Kv.NewTransaction(false)
+
+	index, term, err := getAppliedIdxTermForSnapshot(engines.Raft, txn, regionId)
+	if err != nil {
+		return nil, err
+	}
+	......
+}
+
+func getAppliedIdxTermForSnapshot(raft *badger.DB, kv *badger.Txn, regionId uint64) (uint64, uint64, error) {
+	applyState := new(rspb.RaftApplyState)
+	err := engine_util.GetMetaFromTxn(kv, meta.ApplyStateKey(regionId), applyState)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	idx := applyState.AppliedIndex
+	var term uint64
+	if idx == applyState.TruncatedState.Index {
+		term = applyState.TruncatedState.Term
+	} else {
+		entry, err := meta.GetRaftEntry(raft, regionId, idx)
+		if err != nil {
+			return 0, 0, err
+		} else {
+			term = entry.GetTerm()
+		}
+	}
+	return idx, term, nil
+}
+```
+
+之前在`processAdminRequest()`里面把`applyState`保存到 badger，现将其读取出来。显然，`Snapshot.Metadata.Index`和`Snapshot.Metadata.Term`就是`AppliedIndex`及其对应的 term。
+
+![](./imgs/snapshotindex.png)
+
+把 snapshot 应用到 RaftLog：
+```go
+func (l *RaftLog) restore(s *pb.Snapshot) {
+	log.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	l.committed = s.Metadata.Index
+	l.offset = s.Metadata.Index + 1
+	l.pendingSnapshot = s
+}
+```
+
+`s.Metadata.Index`就是`AppliedIndex`，该位置上的日志必然是“已提交”的，并且已经被持久化了（见`PeerStorage.Append()`）；`offset`指向的是第一条不可靠（即未持久化）的日志，所以`offset`设置成`s.Metadata.Index + 1`。
+
+`RaftLog.FirstIndex()`逻辑：
+```go
+func (l *RaftLog) FirstIndex() uint64 {
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index + 1
+	}
+	i, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	return i
+}
+```
+
+这是参考 etcd 的实现：
+```go
+func (l *raftLog) firstIndex() uint64 {
+	if i, ok := l.unstable.maybeFirstIndex(); ok {
+		return i
+	}
+	index, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err) // TODO(bdarnell)
+	}
+	return index
+}
+
+func (u *unstable) maybeFirstIndex() (uint64, bool) {
+	if u.snapshot != nil {
+		return u.snapshot.Metadata.Index + 1, true
+	}
+	return 0, false
+}
+```
+
+`l.pendingSnapshot.Metadata.Index + 1`等于`l.offset`，也就是第一个 unstable entry 的索引。为什么要这样做？如果`RaftLog`没有装载 snapshot，显然`FirstIndex`应是第一个 stable entry 的索引，因为 stable entries 更靠前，后面跟着的是 unstable entries；如果装载了 snapshot，由于`Snapshot.Metadata.Index`就是`AppliedIndex`，根据前面对 log compaction 的分析可知，`AppliedIndex`之前的 entries 会被丢弃掉，所以剩下的第一条日志就是`AppliedIndex`对应的那条。**由于第一条日志是一个 dummy entry，所以真正的“第一条”日志的索引还要再+1**。
+
+`RaftLog.LastIndex()`的逻辑也是参考 etcd 实现的：
+```go
+func (l *RaftLog) LastIndex() uint64 {
+	// Your Code Here (2A).
+	if n := uint64(len(l.entries)); n > 0 {
+		return l.offset + n - 1
+	}
+	if l.pendingSnapshot != nil {
+		return l.pendingSnapshot.Metadata.Index
+	}
+	i, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err)
+	}
+	return i
+}
+```
+
+etcd：
+```go
+func (l *raftLog) lastIndex() uint64 {
+	if i, ok := l.unstable.maybeLastIndex(); ok {
+		return i
+	}
+	i, err := l.storage.LastIndex()
+	if err != nil {
+		panic(err) // TODO(bdarnell)
+	}
+	return i
+}
+
+func (u *unstable) maybeLastIndex() (uint64, bool) {
+	if l := len(u.entries); l != 0 {
+		return u.offset + uint64(l) - 1, true
+	}
+	if u.snapshot != nil {
+		return u.snapshot.Metadata.Index, true
+	}
+	return 0, false
+}
+```
