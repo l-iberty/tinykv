@@ -3,13 +3,18 @@ package test_raftstore
 import (
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	_ "net/http/pprof"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pingcap-incubator/tinykv/kv/models"
+	"github.com/pingcap-incubator/tinykv/kv/porcupine"
 
 	"github.com/Connor1996/badger"
 	"github.com/pingcap-incubator/tinykv/kv/config"
@@ -341,6 +346,423 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 	}
 }
 
+// similar to GenericTest, but with clients doing random operations (and using a
+// linearizability checker)
+func GenericTestLinearizability2(t *testing.T, part string, nclients int, nservers int, unreliable bool, crash bool, partitions bool, maxraftlog int, confchange bool, split bool) {
+
+	title := "Test: "
+	if unreliable {
+		// the network drops RPC requests and replies.
+		title = title + "unreliable net, "
+	}
+	if crash {
+		// peers re-start, and thus persistence must work.
+		title = title + "restarts, "
+	}
+	if partitions {
+		// the network may partition
+		title = title + "partitions, "
+	}
+	if maxraftlog != -1 {
+		title = title + "snapshots, "
+	}
+	if nclients > 1 {
+		title = title + "many clients"
+	} else {
+		title = title + "one client"
+	}
+	title = title + ", linearizability checks (" + part + ")" // 3A or 3B
+
+	cfg := config.NewTestConfig()
+	if maxraftlog != -1 {
+		cfg.RaftLogGcCountLimit = uint64(maxraftlog)
+	}
+	if split {
+		cfg.RegionMaxSize = 300
+		cfg.RegionSplitSize = 200
+	}
+	cluster := NewTestCluster(nservers, cfg)
+	cluster.Start()
+	defer cluster.Shutdown()
+
+	electionTimeout := cfg.RaftBaseTickInterval * time.Duration(cfg.RaftElectionTimeoutTicks)
+	// Wait for leader election
+	time.Sleep(2 * electionTimeout)
+
+	linearizabilityCheckTimeout := cfg.RaftBaseTickInterval * time.Duration(cfg.RaftElectionTimeoutTicks)
+
+	begin := time.Now()
+	var operations []porcupine.Operation
+	var opMu sync.Mutex
+
+	done_partitioner := int32(0)
+	done_confchanger := int32(0)
+	done_clients := int32(0)
+	ch_partitioner := make(chan bool)
+	ch_confchange := make(chan bool)
+	ch_clients := make(chan bool)
+	clnts := make([]chan int, nclients)
+	for i := 0; i < nclients; i++ {
+		clnts[i] = make(chan int, 1)
+	}
+	for i := 0; i < 3; i++ {
+		// log.Printf("Iteration %v\n", i)
+		atomic.StoreInt32(&done_clients, 0)
+		atomic.StoreInt32(&done_partitioner, 0)
+		go SpawnClientsAndWait(t, ch_clients, nclients, func(cli int, t *testing.T) {
+			j := 0
+			defer func() {
+				clnts[cli] <- j
+			}()
+			last := ""
+			for atomic.LoadInt32(&done_clients) == 0 {
+				var input models.KvInput
+				var output models.KvOutput
+				start := int64(time.Since(begin))
+				if (rand.Int() % 1000) < 500 {
+					key := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
+					value := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
+					// log.Infof("%d: client new put %v,%v", cli, key, value)
+					cluster.MustPut([]byte(key), []byte(value))
+					input = models.KvInput{Op: models.OpType_Put, Key: key, Value: value}
+					last = NextValue(last, value)
+					j++
+				} else {
+					start := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", 0)
+					end := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j)
+					// log.Infof("%d: client new scan %v-%v", cli, start, end)
+					values := cluster.Scan([]byte(start), []byte(end))
+					v := string(bytes.Join(values, []byte("")))
+					if v != last {
+						log.Fatalf("get wrong value, client %v\nwant:%v\ngot: %v\n", cli, last, v)
+					}
+					if len(values) > 0 {
+						value := string(bytes.Join(values[len(values)-1:], []byte("")))
+						key := strconv.Itoa(cli) + " " + fmt.Sprintf("%08d", j-1)
+						input = models.KvInput{Op: models.OpType_Get, Key: key}
+						output = models.KvOutput{Value: value}
+					}
+				}
+				end := int64(time.Since(begin))
+				op := porcupine.Operation{Input: input, Call: start, Output: output, Return: end, ClientId: cli}
+				opMu.Lock()
+				operations = append(operations, op)
+				opMu.Unlock()
+			}
+		})
+
+		if partitions {
+			// Allow the clients to perform some operations without interruption
+			time.Sleep(1 * time.Second)
+			go partitioner(t, cluster, ch_partitioner, &done_partitioner, unreliable, electionTimeout)
+		}
+		if confchange {
+			// Allow the clients to perfrom some operations without interruption
+			time.Sleep(100 * time.Millisecond)
+			go confchanger(t, cluster, ch_confchange, &done_confchanger)
+		}
+		time.Sleep(5 * time.Second)
+
+		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
+		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
+		atomic.StoreInt32(&done_confchanger, 1) // tell confchanger to quit
+
+		if partitions {
+			// log.Printf("wait for partitioner\n")
+			<-ch_partitioner
+			// reconnect network and submit a request. A client may
+			// have submitted a request in a minority.  That request
+			// won't return until that server discovers a new term
+			// has started.
+			cluster.ClearFilters()
+			// wait for a while so that we have a new term
+			time.Sleep(electionTimeout)
+		}
+
+		// wait for clients
+		<-ch_clients
+
+		if crash {
+			log.Warnf("shutdown servers\n")
+			for i := 1; i <= nservers; i++ {
+				cluster.StopServer(uint64(i))
+			}
+			// Wait for a while for servers to shutdown, since
+			// shutdown isn't a real crash and isn't instantaneous
+			time.Sleep(electionTimeout)
+			log.Warnf("restart servers\n")
+			// crash and re-start all
+			for i := 1; i <= nservers; i++ {
+				cluster.StartServer(uint64(i))
+			}
+		}
+
+		// wait for clients.
+		for i := 0; i < nclients; i++ {
+			<-clnts[i]
+		}
+
+		if maxraftlog > 0 {
+			time.Sleep(1 * time.Second)
+
+			// Check maximum after the servers have processed all client
+			// requests and had time to checkpoint.
+			key := []byte("")
+			for {
+				region := cluster.GetRegion(key)
+				if region == nil {
+					panic("region is not found")
+				}
+				for _, engine := range cluster.engines {
+					state, err := meta.GetApplyState(engine.Kv, region.GetId())
+					if err == badger.ErrKeyNotFound {
+						continue
+					}
+					if err != nil {
+						panic(err)
+					}
+					truncatedIdx := state.TruncatedState.Index
+					appliedIdx := state.AppliedIndex
+					if appliedIdx-truncatedIdx > 2*uint64(maxraftlog) {
+						t.Fatalf("logs were not trimmed (%v - %v > 2*%v)", appliedIdx, truncatedIdx, maxraftlog)
+					}
+				}
+
+				key = region.EndKey
+				if len(key) == 0 {
+					break
+				}
+			}
+		}
+
+		if split {
+			r := cluster.GetRegion([]byte(""))
+			if len(r.GetEndKey()) == 0 {
+				t.Fatalf("region is not split")
+			}
+		}
+	}
+
+	res, info := porcupine.CheckOperationsVerbose(models.KvModel, operations, linearizabilityCheckTimeout)
+	if res == porcupine.Illegal {
+		file, err := ioutil.TempFile("", "*.html")
+		if err != nil {
+			fmt.Printf("info: failed to create temp file for visualization")
+		} else {
+			err = porcupine.Visualize(models.KvModel, info, file)
+			if err != nil {
+				fmt.Printf("info: failed to write history visualization to %s\n", file.Name())
+			} else {
+				fmt.Printf("info: wrote history visualization to %s\n", file.Name())
+			}
+		}
+		t.Fatal("history is not linearizable")
+	} else if res == porcupine.Unknown {
+		fmt.Println("info: linearizability check timed out, assuming history is ok")
+	}
+}
+
+func GenericTestLinearizability1(t *testing.T, part string, nclients int, nservers int, unreliable bool, crash bool, partitions bool, maxraftlog int, confchange bool, split bool) {
+
+	title := "Test: "
+	if unreliable {
+		// the network drops RPC requests and replies.
+		title = title + "unreliable net, "
+	}
+	if crash {
+		// peers re-start, and thus persistence must work.
+		title = title + "restarts, "
+	}
+	if partitions {
+		// the network may partition
+		title = title + "partitions, "
+	}
+	if maxraftlog != -1 {
+		title = title + "snapshots, "
+	}
+	if nclients > 1 {
+		title = title + "many clients"
+	} else {
+		title = title + "one client"
+	}
+	title = title + ", linearizability checks (" + part + ")" // 3A or 3B
+
+	cfg := config.NewTestConfig()
+	if maxraftlog != -1 {
+		cfg.RaftLogGcCountLimit = uint64(maxraftlog)
+	}
+	if split {
+		cfg.RegionMaxSize = 300
+		cfg.RegionSplitSize = 200
+	}
+	cluster := NewTestCluster(nservers, cfg)
+	cluster.Start()
+	defer cluster.Shutdown()
+
+	electionTimeout := cfg.RaftBaseTickInterval * time.Duration(cfg.RaftElectionTimeoutTicks)
+	// Wait for leader election
+	time.Sleep(2 * electionTimeout)
+
+	linearizabilityCheckTimeout := cfg.RaftBaseTickInterval * time.Duration(cfg.RaftElectionTimeoutTicks)
+
+	begin := time.Now()
+	var operations []porcupine.Operation
+	var opMu sync.Mutex
+
+	done_partitioner := int32(0)
+	done_confchanger := int32(0)
+	done_clients := int32(0)
+	ch_partitioner := make(chan bool)
+	ch_confchange := make(chan bool)
+	ch_clients := make(chan bool)
+	clnts := make([]chan int, nclients)
+	for i := 0; i < nclients; i++ {
+		clnts[i] = make(chan int, 1)
+	}
+	for i := 0; i < 3; i++ {
+		// log.Printf("Iteration %v\n", i)
+		atomic.StoreInt32(&done_clients, 0)
+		atomic.StoreInt32(&done_partitioner, 0)
+		go SpawnClientsAndWait(t, ch_clients, nclients, func(cli int, t *testing.T) {
+			j := 0
+			defer func() {
+				clnts[cli] <- j
+			}()
+			for atomic.LoadInt32(&done_clients) == 0 {
+				key := strconv.Itoa(rand.Int() % nclients)
+				value := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
+				var input models.KvInput
+				var output models.KvOutput
+				start := int64(time.Since(begin))
+				if (rand.Int() % 1000) < 500 {
+					// log.Infof("%d: client new put %v,%v", cli, key, value)
+					cluster.MustPut([]byte(key), []byte(value))
+					input = models.KvInput{Op: models.OpType_Put, Key: key, Value: value}
+				} else {
+					// log.Infof("%d: client new get %v", cli, key)
+					v := string(cluster.Get([]byte(key)))
+					input = models.KvInput{Op: models.OpType_Get, Key: key}
+					output = models.KvOutput{Value: v}
+				}
+				end := int64(time.Since(begin))
+				op := porcupine.Operation{Input: input, Call: start, Output: output, Return: end, ClientId: cli}
+				opMu.Lock()
+				operations = append(operations, op)
+				opMu.Unlock()
+			}
+		})
+
+		if partitions {
+			// Allow the clients to perform some operations without interruption
+			time.Sleep(1 * time.Second)
+			go partitioner(t, cluster, ch_partitioner, &done_partitioner, unreliable, electionTimeout)
+		}
+		if confchange {
+			// Allow the clients to perfrom some operations without interruption
+			time.Sleep(100 * time.Millisecond)
+			go confchanger(t, cluster, ch_confchange, &done_confchanger)
+		}
+		time.Sleep(5 * time.Second)
+
+		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
+		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
+		atomic.StoreInt32(&done_confchanger, 1) // tell confchanger to quit
+
+		if partitions {
+			// log.Printf("wait for partitioner\n")
+			<-ch_partitioner
+			// reconnect network and submit a request. A client may
+			// have submitted a request in a minority.  That request
+			// won't return until that server discovers a new term
+			// has started.
+			cluster.ClearFilters()
+			// wait for a while so that we have a new term
+			time.Sleep(electionTimeout)
+		}
+
+		// wait for clients
+		<-ch_clients
+
+		if crash {
+			log.Warnf("shutdown servers\n")
+			for i := 1; i <= nservers; i++ {
+				cluster.StopServer(uint64(i))
+			}
+			// Wait for a while for servers to shutdown, since
+			// shutdown isn't a real crash and isn't instantaneous
+			time.Sleep(electionTimeout)
+			log.Warnf("restart servers\n")
+			// crash and re-start all
+			for i := 1; i <= nservers; i++ {
+				cluster.StartServer(uint64(i))
+			}
+		}
+
+		// wait for clients.
+		for i := 0; i < nclients; i++ {
+			<-clnts[i]
+		}
+
+		if maxraftlog > 0 {
+			time.Sleep(1 * time.Second)
+
+			// Check maximum after the servers have processed all client
+			// requests and had time to checkpoint.
+			key := []byte("")
+			for {
+				region := cluster.GetRegion(key)
+				if region == nil {
+					panic("region is not found")
+				}
+				for _, engine := range cluster.engines {
+					state, err := meta.GetApplyState(engine.Kv, region.GetId())
+					if err == badger.ErrKeyNotFound {
+						continue
+					}
+					if err != nil {
+						panic(err)
+					}
+					truncatedIdx := state.TruncatedState.Index
+					appliedIdx := state.AppliedIndex
+					if appliedIdx-truncatedIdx > 2*uint64(maxraftlog) {
+						t.Fatalf("logs were not trimmed (%v - %v > 2*%v)", appliedIdx, truncatedIdx, maxraftlog)
+					}
+				}
+
+				key = region.EndKey
+				if len(key) == 0 {
+					break
+				}
+			}
+		}
+
+		if split {
+			r := cluster.GetRegion([]byte(""))
+			if len(r.GetEndKey()) == 0 {
+				t.Fatalf("region is not split")
+			}
+		}
+	}
+
+	res, info := porcupine.CheckOperationsVerbose(models.KvModel, operations, linearizabilityCheckTimeout)
+	if res == porcupine.Illegal {
+		file, err := ioutil.TempFile("", "*.html")
+		if err != nil {
+			fmt.Printf("info: failed to create temp file for visualization")
+		} else {
+			err = porcupine.Visualize(models.KvModel, info, file)
+			if err != nil {
+				fmt.Printf("info: failed to write history visualization to %s\n", file.Name())
+			} else {
+				fmt.Printf("info: wrote history visualization to %s\n", file.Name())
+			}
+		}
+		t.Fatal("history is not linearizable")
+	} else if res == porcupine.Unknown {
+		fmt.Println("info: linearizability check timed out, assuming history is ok")
+	}
+}
+
 func TestBasic2B(t *testing.T) {
 	// Test: one client (2B) ...
 	GenericTest(t, "2B", 1, false, false, false, -1, false, false)
@@ -441,8 +863,18 @@ func TestPersistPartition2B(t *testing.T) {
 }
 
 func TestPersistPartitionUnreliable2B(t *testing.T) {
-	// Test: unreliable net, restarts, partitions, many clients (3A) ...
+	// Test: unreliable net, restarts, partitions, many clients (2B) ...
 	GenericTest(t, "2B", 5, true, true, true, -1, false, false)
+}
+
+func TestPersistPartitionUnreliableLinearizable12B(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, linearizability checks (2B) ...
+	GenericTestLinearizability1(t, "2B", 15, 7, true, true, true, -1, false, false)
+}
+
+func TestPersistPartitionUnreliableLinearizable22B(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, linearizability checks (2B) ...
+	GenericTestLinearizability2(t, "2B", 15, 7, true, true, true, -1, false, false)
 }
 
 func TestOneSnapshot2C(t *testing.T) {
@@ -531,6 +963,16 @@ func TestSnapshotUnreliableRecover2C(t *testing.T) {
 func TestSnapshotUnreliableRecoverConcurrentPartition2C(t *testing.T) {
 	// Test: unreliable net, restarts, partitions, snapshots, many clients (2C) ...
 	GenericTest(t, "2C", 5, true, true, true, 100, false, false)
+}
+
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable12C(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (2C) ...
+	GenericTestLinearizability1(t, "2C", 15, 7, true, true, true, 100, false, false)
+}
+
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable22C(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (2C) ...
+	GenericTestLinearizability2(t, "2C", 15, 7, true, true, true, 100, false, false)
 }
 
 func TestTransferLeader3B(t *testing.T) {

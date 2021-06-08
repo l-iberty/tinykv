@@ -245,7 +245,8 @@ func (ps *PeerStorage) FirstIndex() (uint64, error) {
 tinykv 的 log compaction 和 snapshot 是分离的，和 6.824 的实现不同。 6.824 在 log compaction 的同时装载 snapshot。
 
 ### Snapshot
-snapshot 的触发只在一个地方：
+#### snapshot的触发
+snapshot的触发只在一个地方：
 ```go
 func (r *Raft) sendAppend(to uint64) {
 	// Your Code Here (2A).
@@ -487,3 +488,29 @@ func (u *unstable) maybeLastIndex() (uint64, bool) {
 	return 0, false
 }
 ```
+
+### 线性一致性测试
+2B、2C 缺少线性一致性测试，故参照 MIT6.824 进行补充：
+```go
+func TestPersistPartitionUnreliableLinearizable12B(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, linearizability checks (2B) ...
+	GenericTestLinearizability1(t, "2B", 15, 7, true, true, true, -1, false, false)
+}
+
+func TestPersistPartitionUnreliableLinearizable22B(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, linearizability checks (2B) ...
+	GenericTestLinearizability2(t, "2B", 15, 7, true, true, true, -1, false, false)
+}
+
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable12C(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (2C) ...
+	GenericTestLinearizability1(t, "2C", 15, 7, true, true, true, 100, false, false)
+}
+
+func TestSnapshotUnreliableRecoverConcurrentPartitionLinearizable22C(t *testing.T) {
+	// Test: unreliable net, restarts, partitions, snapshots, linearizability checks (2C) ...
+	GenericTestLinearizability2(t, "2C", 15, 7, true, true, true, 100, false, false)
+}
+```
+
+这两种测试的区别在于`GenericTestLinearizability2`是通过`Scan`来实现`Get`的功能，也就是发送`Snap`请求获取数据快照，截取上一个 key 对应的 value；`GenericTestLinearizability1`则是直接发送`Get`请求。
