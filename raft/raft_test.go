@@ -1339,7 +1339,7 @@ func TestLeaderTransferAfterSnapshot3A(t *testing.T) {
 	// Transfer leadership to 3 when node 3 is lack of snapshot.
 	nt.send(pb.Message{From: 3, To: 1, MsgType: pb.MessageType_MsgTransferLeader})
 	// Send pb.MessageType_MsgHeartbeatResponse to leader to trigger a snapshot for node 3.
-	nt.send(pb.Message{From: 3, To: 1, MsgType: pb.MessageType_MsgHeartbeatResponse, Term: lead.Term})
+	// nt.send(pb.Message{From: 3, To: 1, MsgType: pb.MessageType_MsgHeartbeatResponse, Term: lead.Term}) // 无意义
 
 	checkLeaderTransferState(t, lead, StateFollower, 3)
 }

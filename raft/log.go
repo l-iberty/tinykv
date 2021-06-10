@@ -371,6 +371,7 @@ func (l *RaftLog) restore(s *pb.Snapshot) {
 	log.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
 	l.committed = s.Metadata.Index
 	l.offset = s.Metadata.Index + 1
+	l.entries = nil
 	l.pendingSnapshot = s
 }
 

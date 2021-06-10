@@ -356,6 +356,11 @@ func (r *Raft) tickHeartbeat() {
 
 	if r.electionElapsed >= r.electionTimeout {
 		r.electionElapsed = 0
+
+		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+		if r.State == StateLeader && r.leadTransferee != None {
+			r.abortLeaderTransfer()
+		}
 	}
 
 	if r.State != StateLeader {
@@ -455,6 +460,8 @@ func (r *Raft) reset(term uint64) {
 	r.heartbeatElapsed = 0
 	r.resetRandomizedElectionTimeout()
 
+	r.abortLeaderTransfer()
+
 	r.votes = map[uint64]bool{}
 	for id := range r.Prs {
 		r.Prs[id] = &Progress{
@@ -498,6 +505,14 @@ func (r *Raft) pastElectionTimeout() bool {
 
 func (r *Raft) resetRandomizedElectionTimeout() {
 	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) sendTimeoutNow(to uint64) {
+	r.send(pb.Message{To: to, MsgType: pb.MessageType_MsgTimeoutNow})
+}
+
+func (r *Raft) abortLeaderTransfer() {
+	r.leadTransferee = None
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -561,7 +576,21 @@ func stepFollower(r *Raft, m pb.Message) error {
 		r.electionElapsed = 0
 		r.Lead = m.From
 		r.handleSnapshot(m)
+	case pb.MessageType_MsgTransferLeader:
+		if r.Lead == None {
+			log.Infof("%x no leader at term %d; dropping leader transfer msg", r.id, r.Term)
+			return nil
+		}
+		m.To = r.Lead
+		r.send(m)
+	case pb.MessageType_MsgTimeoutNow:
+		log.Infof("%x [term %d] received MsgTimeoutNow from %x and starts an election to get leadership.", r.id, r.Term, m.From)
+		// Leadership transfers never use pre-vote even if r.preVote is true; we
+		// know we are not recovering from a partition so there is no need for the
+		// extra round trip.
+		r.hup()
 	}
+
 	return nil
 }
 
@@ -608,6 +637,26 @@ func stepLeader(r *Raft, m pb.Message) error {
 			// drop any new proposals.
 			return ErrProposalDropped
 		}
+		if r.leadTransferee != None {
+			log.Infof("%x [term %d] transfer leadership to %x is in progress; dropping proposal", r.id, r.Term, r.leadTransferee)
+			return ErrProposalDropped
+		}
+
+		for i := range m.Entries {
+			e := m.Entries[i]
+			if e.EntryType == pb.EntryType_EntryConfChange {
+				var cc pb.ConfChange
+				if err := cc.Unmarshal(e.Data); err != nil {
+					panic(err)
+				}
+
+				if r.PendingConfIndex > r.RaftLog.applied { // already pending
+					m.Entries[i] = &pb.Entry{EntryType: pb.EntryType_EntryNormal}
+				} else {
+					r.PendingConfIndex = r.RaftLog.LastIndex() + uint64(i) + 1
+				}
+			}
+		}
 
 		r.appendEntries(m.Entries...)
 		r.bcastAppend()
@@ -637,12 +686,45 @@ func stepLeader(r *Raft, m pb.Message) error {
 				if r.maybeCommit() {
 					r.bcastAppend()
 				}
+				// Transfer leadership is in progress.
+				if m.From == r.leadTransferee && pr.Match == r.RaftLog.LastIndex() {
+					log.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp", r.id, m.From)
+					r.sendTimeoutNow(m.From)
+				}
 			}
 		}
 	case pb.MessageType_MsgHeartbeatResponse:
 		if pr.Match < r.RaftLog.LastIndex() {
 			r.sendAppend(m.From)
 		}
+	case pb.MessageType_MsgTransferLeader:
+		leadTransferee := m.From
+		lastLeadTransferee := r.leadTransferee
+		if lastLeadTransferee != None {
+			if lastLeadTransferee == leadTransferee {
+				log.Infof("%x [term %d] transfer leadership to %x is in progress, ignores request to same node %x",
+					r.id, r.Term, leadTransferee, leadTransferee)
+				return nil
+			}
+			r.abortLeaderTransfer()
+			log.Infof("%x [term %d] abort previous transferring leadership to %x", r.id, r.Term, lastLeadTransferee)
+		}
+		if leadTransferee == r.id {
+			log.Debugf("%x is already leader. Ignored transferring leadership to self", r.id)
+			return nil
+		}
+		// Transfer leadership to third party.
+		log.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
+		// Transfer leadership should be finished in one electionTimeout, so reset r.electionElapsed.
+		r.electionElapsed = 0
+		r.leadTransferee = leadTransferee
+		if pr.Match == r.RaftLog.LastIndex() {
+			r.sendTimeoutNow(leadTransferee)
+			log.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log", r.id, leadTransferee, leadTransferee)
+		} else {
+			r.sendAppend(leadTransferee)
+		}
+
 	}
 	return nil
 }
@@ -693,9 +775,7 @@ func (r *Raft) campaign() {
 			LogTerm: r.RaftLog.LastTerm(),
 		}
 		r.send(m)
-
-		log.Infof("%x [logterm: %d, index: %d] sent %s to %x at term %d",
-			r.id, m.LogTerm, m.Index, m.MsgType, id, r.Term)
+		log.Infof("%x [logterm: %d, index: %d] sent %s to %x at term %d", r.id, m.LogTerm, m.Index, m.MsgType, id, r.Term)
 	}
 }
 
@@ -853,7 +933,15 @@ func (r *Raft) restore(s *pb.Snapshot) bool {
 	// Reset the configuration and add the (potentially updated) peers in anew.
 	r.Prs = map[uint64]*Progress{}
 	for _, id := range s.Metadata.ConfState.Nodes {
-		r.Prs[id] = &Progress{}
+		r.Prs[id] = &Progress{
+			Match: 0,
+			Next:  r.RaftLog.LastIndex(),
+		}
+	}
+
+	// If the the leadTransferee was removed or demoted, abort the leadership transfer.
+	if _, ok := r.Prs[r.leadTransferee]; !ok && r.leadTransferee != None {
+		r.abortLeaderTransfer()
 	}
 
 	log.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] restored snapshot [index: %d, term: %d]",
@@ -864,11 +952,17 @@ func (r *Raft) restore(s *pb.Snapshot) bool {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	delete(r.Prs, id)
+	r.maybeCommit()
 }
 
 func (r *Raft) softState() *SoftState { return &SoftState{Lead: r.Lead, RaftState: r.State} }
