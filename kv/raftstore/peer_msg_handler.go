@@ -149,45 +149,87 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	if msg.AdminRequest != nil {
+		d.executeAdminRequest(msg, cb)
+	} else {
+		d.proposeData(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) executeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	switch msg.AdminRequest.CmdType {
+	case raft_cmdpb.AdminCmdType_TransferLeader:
+		t := msg.AdminRequest.TransferLeader
+		d.RaftGroup.TransferLeader(t.Peer.Id)
+
+		resp := &raft_cmdpb.RaftCmdResponse{
+			Header: &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
+			AdminResponse: &raft_cmdpb.AdminResponse{
+				CmdType:        raft_cmdpb.AdminCmdType_TransferLeader,
+				TransferLeader: &raft_cmdpb.TransferLeaderResponse{},
+			},
+		}
+		cb.Done(resp)
+
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		ctx, err := msg.Marshal()
+		if err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+		cc := eraftpb.ConfChange{
+			ChangeType: msg.AdminRequest.ChangePeer.ChangeType,
+			NodeId:     msg.AdminRequest.ChangePeer.Peer.Id,
+			Context:    ctx,
+		}
+		d.putProposal(cb)
+		if err := d.RaftGroup.ProposeConfChange(cc); err != nil {
+			cb.Done(ErrResp(err))
+			return
+		}
+	default:
+		d.proposeData(msg, cb)
+	}
+}
+
+func (d *peerMsgHandler) proposeData(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	data, err := msg.Marshal()
+	if err != nil {
+		panic(err)
+	}
+
+	d.putProposal(cb)
+	if err := d.RaftGroup.Propose(data); err != nil {
+		panic(err)
+	}
+}
+
+func (d *peerMsgHandler) putProposal(cb *message.Callback) *proposal {
 	p := &proposal{
 		index: d.nextProposalIndex(),
 		term:  d.Term(),
 		cb:    cb,
 	}
-	if msg.AdminRequest != nil {
-		d.proposeAdminRequest(msg, p)
-	} else {
-		d.proposeData(msg, p)
-	}
-}
-
-func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest, p *proposal) {
-	switch msg.AdminRequest.CmdType {
-	case raft_cmdpb.AdminCmdType_CompactLog:
-	}
-	d.proposeData(msg, p)
-}
-
-func (d *peerMsgHandler) proposeData(msg *raft_cmdpb.RaftCmdRequest, p *proposal) {
-	data, err := msg.Marshal()
-	if err != nil {
-		p.cb.Done(ErrResp(err))
-		return
-	}
 	d.proposals[p.index] = p
-	if err := d.RaftGroup.Propose(data); err != nil {
-		p.cb.Done(ErrResp(err))
-		return
-	}
+	return p
+}
+
+func (d *peerMsgHandler) removeProposal(p *proposal) {
+	delete(d.proposals, p.index)
 }
 
 func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
+	kvWB := new(engine_util.WriteBatch)
+	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+		d.processConfChangeRequest(entry, kvWB)
+		return
+	}
+
 	msg := new(raft_cmdpb.RaftCmdRequest)
 	if err := msg.Unmarshal(entry.Data); err != nil {
 		panic(err)
 	}
 
-	kvWB := new(engine_util.WriteBatch)
 	if msg.AdminRequest != nil {
 		d.processAdminRequest(entry, msg, kvWB)
 	} else {
@@ -307,6 +349,7 @@ func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, msg *raft_cmd
 				panic(err)
 			}
 			d.ScheduleCompactLog(c.CompactIndex)
+
 			resp := &raft_cmdpb.RaftCmdResponse{
 				Header: &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
 				AdminResponse: &raft_cmdpb.AdminResponse{
@@ -318,7 +361,31 @@ func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, msg *raft_cmd
 				p.cb.Done(resp)
 			})
 		}
+	case raft_cmdpb.AdminCmdType_Split:
 	}
+}
+
+func (d *peerMsgHandler) processConfChangeRequest(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
+	var cc eraftpb.ConfChange
+	var msg raft_cmdpb.RaftCmdRequest
+	if err := cc.Unmarshal(entry.Data); err != nil {
+		panic(err)
+	}
+	if err := msg.Unmarshal(cc.Context); err != nil {
+		panic(err)
+	}
+	d.RaftGroup.ApplyConfChange(cc)
+
+	resp := &raft_cmdpb.RaftCmdResponse{
+		Header: &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
+		AdminResponse: &raft_cmdpb.AdminResponse{
+			CmdType:    raft_cmdpb.AdminCmdType_ChangePeer,
+			ChangePeer: &raft_cmdpb.ChangePeerResponse{},
+		},
+	}
+	d.notify(entry, func(p *proposal) {
+		p.cb.Done(resp)
+	})
 }
 
 func (d *peerMsgHandler) checkKeyInRegion(key []byte) error {
@@ -355,7 +422,7 @@ func (d *peerMsgHandler) notify(entry *eraftpb.Entry, fn func(p *proposal)) {
 			d.PeerId(), entry.Index, entry.Term, p.term)
 		NotifyStaleReq(entry.Term, p.cb)
 	}
-	delete(d.proposals, p.index)
+	d.removeProposal(p)
 }
 
 func (d *peerMsgHandler) onTick() {
