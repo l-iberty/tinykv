@@ -58,13 +58,16 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		d.Send(d.ctx.trans, rd.Messages)
 
 		if n := len(rd.CommittedEntries); n > 0 {
+			kvWB := new(engine_util.WriteBatch)
 			for _, ent := range rd.CommittedEntries {
 				if ent.Data != nil {
-					d.process(&ent)
+					d.process(&ent, kvWB)
+					if d.stopped {
+						return
+					}
 				}
 			}
 
-			kvWB := new(engine_util.WriteBatch)
 			d.peerStorage.appliedTo(rd.CommittedEntries[n-1].Index)
 			if d.peerStorage.raftState.LastIndex < d.peerStorage.AppliedIndex() {
 				panic(nil)
@@ -218,8 +221,7 @@ func (d *peerMsgHandler) removeProposal(p *proposal) {
 	delete(d.proposals, p.index)
 }
 
-func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
-	kvWB := new(engine_util.WriteBatch)
+func (d *peerMsgHandler) process(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
 	if entry.EntryType == eraftpb.EntryType_EntryConfChange {
 		d.processConfChangeRequest(entry, kvWB)
 		return
@@ -234,11 +236,6 @@ func (d *peerMsgHandler) process(entry *eraftpb.Entry) {
 		d.processAdminRequest(entry, req, kvWB)
 	} else {
 		d.processRequests(entry, req, kvWB)
-	}
-	if kvWB.Len() > 0 {
-		if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
-			return
-		}
 	}
 }
 
@@ -382,13 +379,6 @@ func (d *peerMsgHandler) processConfChangeRequest(entry *eraftpb.Entry, kvWB *en
 		return
 	}
 
-	switch cc.ChangeType {
-	case eraftpb.ConfChangeType_AddNode:
-	case eraftpb.ConfChangeType_RemoveNode:
-	}
-
-	d.RaftGroup.ApplyConfChange(cc)
-
 	resp := &raft_cmdpb.RaftCmdResponse{
 		Header: &raft_cmdpb.RaftResponseHeader{CurrentTerm: d.Term()},
 		AdminResponse: &raft_cmdpb.AdminResponse{
@@ -396,50 +386,88 @@ func (d *peerMsgHandler) processConfChangeRequest(entry *eraftpb.Entry, kvWB *en
 			ChangePeer: &raft_cmdpb.ChangePeerResponse{},
 		},
 	}
+
+	switch cc.ChangeType {
+	case eraftpb.ConfChangeType_AddNode:
+		if done := d.handleAddNode(entry, &req, resp); done {
+			return
+		}
+	case eraftpb.ConfChangeType_RemoveNode:
+		if req.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
+			d.destroyPeer()
+			return
+		}
+		if done := d.handleRemoveNode(entry, &req, resp); done {
+			return
+		}
+	}
+
+	d.updateRegionEpoch(req.AdminRequest.CmdType)
+	d.ctx.storeMeta.putRegion(d.Region())
+	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+
+	d.RaftGroup.ApplyConfChange(cc)
+
 	d.notify(entry, func(p *proposal) {
 		p.cb.Done(resp)
 	})
+
+	if d.IsLeader() {
+		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
+	}
 }
 
-func (d *peerMsgHandler) handleAddNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch) {
+func (d *peerMsgHandler) handleAddNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse) bool {
 	// check for duplicate command of AddNode
 	for _, peer := range d.Region().Peers {
 		if peer.Id == req.AdminRequest.ChangePeer.Peer.Id {
 			d.notify(entry, func(p *proposal) {
 				p.cb.Done(resp)
 			})
-			return
+			return true
 		}
 	}
-
-	// update RegionEpoch
-	re := &metapb.RegionEpoch{
-		ConfVer: d.Region().RegionEpoch.ConfVer + 1,
-		Version: d.Region().RegionEpoch.Version,
-	}
-	d.Region().RegionEpoch = re
 
 	peer := req.AdminRequest.ChangePeer.Peer
-	d.insertPeerCache(peer)
 	d.peerStorage.region.Peers = append(d.peerStorage.region.Peers, peer)
-
-	// update the region state in storeMeta of GlobalContext
-	d.ctx.storeMeta.putRegion(d.Region())
-
-	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+	d.insertPeerCache(peer)
+	return false
 }
 
-func (d *peerMsgHandler) handleRemoveNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse, kvWB *engine_util.WriteBatch) {
-
+func (d *peerMsgHandler) handleRemoveNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse) bool {
+	peerId := req.AdminRequest.ChangePeer.Peer.Id
+	if peerId == d.PeerId() {
+		panic(fmt.Sprintf("peer %d should have been destroyed", peerId))
+	}
+	peers, removed := d.maybeRemovePeer(d.peerStorage.region.Peers, peerId)
+	if !removed {
+		d.notify(entry, func(p *proposal) {
+			p.cb.Done(resp)
+		})
+		return true
+	}
+	d.peerStorage.region.Peers = peers
+	d.removePeerCache(peerId)
+	return false
 }
 
-func (d *peerMsgHandler)removePeer(peers []*metapb.Peer, peerId uint64) []*metapb.Peer{
-	tmp:=make([]*metapb.Peer,len(peers))
-	for i:=range peers{
-		if peers[i].Id==peerId{
-			tmp=append([]*metapb.Peer,peers[:i]...)
+func (d *peerMsgHandler) updateRegionEpoch(t raft_cmdpb.AdminCmdType) {
+	switch t {
+	case raft_cmdpb.AdminCmdType_ChangePeer:
+		d.peerStorage.region.RegionEpoch.ConfVer++
+	case raft_cmdpb.AdminCmdType_Split:
+		d.peerStorage.region.RegionEpoch.Version++
+	}
+}
+
+func (d *peerMsgHandler) maybeRemovePeer(peers []*metapb.Peer, peerId uint64) ([]*metapb.Peer, bool) {
+	for i := range peers {
+		if peers[i].Id == peerId {
+			peers = append(peers[:i], peers[i+1:]...)
+			return peers, true
 		}
 	}
+	return peers, false
 }
 
 func (d *peerMsgHandler) checkKeyInRegion(key []byte) error {
