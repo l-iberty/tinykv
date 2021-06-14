@@ -60,6 +60,12 @@ func (m *storeMeta) putRegion(region *metapb.Region) {
 	m.regionRanges.ReplaceOrInsert(&regionItem{region: region})
 }
 
+func (m *storeMeta) removeRegion(region *metapb.Region) {
+	m.Lock()
+	defer m.Unlock()
+	m.regionRanges.Delete(&regionItem{region: region})
+}
+
 // getOverlaps gets the regions which are overlapped with the specified region range.
 func (m *storeMeta) getOverlapRegions(region *metapb.Region) []*metapb.Region {
 	item := &regionItem{region: region}

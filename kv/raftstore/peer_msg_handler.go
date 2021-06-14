@@ -54,9 +54,10 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if err != nil {
 			panic(err)
 		}
-		if result != nil && reflect.DeepEqual(result.PrevRegion, d.Region()) {
+		if result != nil && !reflect.DeepEqual(result.PrevRegion, result.Region) {
 			d.peerStorage.SetRegion(result.Region)
 			d.ctx.storeMeta.putRegion(d.Region())
+			d.ctx.storeMeta.removeRegion(result.PrevRegion)
 		}
 
 		// sending raft messages to other peers through the network.
@@ -469,15 +470,13 @@ func (d *peerMsgHandler) processConfChangeRequest(entry *eraftpb.Entry, kvWB *en
 			return
 		}
 	case eraftpb.ConfChangeType_RemoveNode:
-		if req.AdminRequest.ChangePeer.Peer.Id == d.PeerId() {
-			d.destroyPeer()
-			return
-		}
 		if done := d.handleRemoveNode(entry, &req, resp); done {
 			return
 		}
+		if cc.NodeId == d.PeerId() {
+			d.destroyPeer()
+		}
 	}
-
 	d.updateRegionEpoch(req.AdminRequest.CmdType)
 	d.ctx.storeMeta.putRegion(d.Region())
 	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
@@ -512,9 +511,6 @@ func (d *peerMsgHandler) handleAddNode(entry *eraftpb.Entry, req *raft_cmdpb.Raf
 
 func (d *peerMsgHandler) handleRemoveNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse) bool {
 	peerId := req.AdminRequest.ChangePeer.Peer.Id
-	if peerId == d.PeerId() {
-		panic(fmt.Sprintf("peer %d should have been destroyed", peerId))
-	}
 	peers, removed := d.maybeRemovePeer(d.peerStorage.region.Peers, peerId)
 	if !removed {
 		d.notify(entry, func(p *proposal) {
