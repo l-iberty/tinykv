@@ -308,7 +308,7 @@ func (d *peerMsgHandler) processRequests(entry *eraftpb.Entry, req *raft_cmdpb.R
 			})
 
 		case raft_cmdpb.CmdType_Snap:
-			log.Infof("%s processing %s command", d.Tag, request.CmdType)
+			// log.Infof("%s processing %s command", d.Tag, request.CmdType)
 			if err := d.checkRegionEpochVersion(req.Header.RegionEpoch); err != nil {
 				d.notify(entry, func(p *proposal) {
 					p.cb.Done(ErrResp(err))
@@ -396,11 +396,14 @@ func (d *peerMsgHandler) processAdminRequest(entry *eraftpb.Entry, req *raft_cmd
 			})
 		}
 		newRegion := &metapb.Region{
-			Id:          split.NewRegionId,
-			StartKey:    split.SplitKey,
-			EndKey:      d.Region().EndKey,
-			RegionEpoch: d.Region().RegionEpoch,
-			Peers:       peers,
+			Id:       split.NewRegionId,
+			StartKey: split.SplitKey,
+			EndKey:   d.Region().EndKey,
+			RegionEpoch: &metapb.RegionEpoch{
+				ConfVer: d.Region().RegionEpoch.ConfVer,
+				Version: d.Region().RegionEpoch.Version,
+			},
+			Peers: peers,
 		}
 		d.Region().EndKey = split.SplitKey
 		d.SizeDiffHint = 0
