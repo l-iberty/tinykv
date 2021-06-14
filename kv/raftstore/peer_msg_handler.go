@@ -308,7 +308,7 @@ func (d *peerMsgHandler) processRequests(entry *eraftpb.Entry, req *raft_cmdpb.R
 			})
 
 		case raft_cmdpb.CmdType_Snap:
-			// log.Infof("%s processing %s command", d.Tag, req.CmdType)
+			log.Infof("%s processing %s command", d.Tag, request.CmdType)
 			if err := d.checkRegionEpochVersion(req.Header.RegionEpoch); err != nil {
 				d.notify(entry, func(p *proposal) {
 					p.cb.Done(ErrResp(err))
