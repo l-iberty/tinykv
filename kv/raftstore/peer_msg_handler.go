@@ -57,7 +57,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		if result != nil && !reflect.DeepEqual(result.PrevRegion, result.Region) {
 			d.peerStorage.SetRegion(result.Region)
 			d.ctx.storeMeta.putRegion(d.Region())
-			d.ctx.storeMeta.removeRegion(result.PrevRegion)
 		}
 
 		// sending raft messages to other peers through the network.
@@ -466,39 +465,41 @@ func (d *peerMsgHandler) processConfChangeRequest(entry *eraftpb.Entry, kvWB *en
 
 	switch cc.ChangeType {
 	case eraftpb.ConfChangeType_AddNode:
-		if done := d.handleAddNode(entry, &req, resp); done {
+		if shouldIgnore := d.handleAddNode(&req); shouldIgnore {
+			d.notify(entry, func(p *proposal) { p.cb.Done(resp) })
 			return
 		}
+		d.updateRegionEpoch(req.AdminRequest.CmdType)
+		d.ctx.storeMeta.putRegion(d.Region())
+		meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+
 	case eraftpb.ConfChangeType_RemoveNode:
-		if done := d.handleRemoveNode(entry, &req, resp); done {
+		if shouldIgnore := d.handleRemoveNode(&req); shouldIgnore {
+			d.notify(entry, func(p *proposal) { p.cb.Done(resp) })
 			return
 		}
-		if cc.NodeId == d.PeerId() {
+		d.updateRegionEpoch(req.AdminRequest.CmdType)
+		d.ctx.storeMeta.putRegion(d.Region())
+		meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
+
+		if cc.NodeId == d.PeerId() && d.peerStorage.snapState.StateType != snap.SnapState_Applying {
 			d.destroyPeer()
+			return
 		}
 	}
-	d.updateRegionEpoch(req.AdminRequest.CmdType)
-	d.ctx.storeMeta.putRegion(d.Region())
-	meta.WriteRegionState(kvWB, d.Region(), rspb.PeerState_Normal)
 
 	d.RaftGroup.ApplyConfChange(cc)
-
-	d.notify(entry, func(p *proposal) {
-		p.cb.Done(resp)
-	})
+	d.notify(entry, func(p *proposal) { p.cb.Done(resp) })
 
 	if d.IsLeader() {
 		d.HeartbeatScheduler(d.ctx.schedulerTaskSender)
 	}
 }
 
-func (d *peerMsgHandler) handleAddNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse) bool {
+func (d *peerMsgHandler) handleAddNode(req *raft_cmdpb.RaftCmdRequest) (shouldIgnore bool) {
 	// check for duplicate command of AddNode
 	for _, peer := range d.Region().Peers {
 		if peer.Id == req.AdminRequest.ChangePeer.Peer.Id {
-			d.notify(entry, func(p *proposal) {
-				p.cb.Done(resp)
-			})
 			return true
 		}
 	}
@@ -509,13 +510,10 @@ func (d *peerMsgHandler) handleAddNode(entry *eraftpb.Entry, req *raft_cmdpb.Raf
 	return false
 }
 
-func (d *peerMsgHandler) handleRemoveNode(entry *eraftpb.Entry, req *raft_cmdpb.RaftCmdRequest, resp *raft_cmdpb.RaftCmdResponse) bool {
+func (d *peerMsgHandler) handleRemoveNode(req *raft_cmdpb.RaftCmdRequest) (shouldIgnore bool) {
 	peerId := req.AdminRequest.ChangePeer.Peer.Id
 	peers, removed := d.maybeRemovePeer(d.peerStorage.region.Peers, peerId)
 	if !removed {
-		d.notify(entry, func(p *proposal) {
-			p.cb.Done(resp)
-		})
 		return true
 	}
 	d.peerStorage.region.Peers = peers

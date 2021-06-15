@@ -344,7 +344,6 @@ func (r *Raft) tickElection() {
 	r.electionElapsed++
 
 	if r.promotable() && r.pastElectionTimeout() {
-		log.Infof("%d election timeout (%d)", r.id, r.randomizedElectionTimeout)
 		r.electionElapsed = 0
 		r.Step(pb.Message{From: r.id, MsgType: pb.MessageType_MsgHup})
 	}
